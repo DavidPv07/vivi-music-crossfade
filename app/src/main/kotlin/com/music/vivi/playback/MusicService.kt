@@ -85,6 +85,8 @@ import com.music.vivi.constants.AudioQualityKey
 import com.music.vivi.constants.AutoDownloadOnLikeKey
 import com.music.vivi.constants.AutoLoadMoreKey
 import com.music.vivi.constants.AutoSkipNextOnErrorKey
+import com.music.vivi.constants.CrossfadeCurve
+import com.music.vivi.constants.CrossfadeCurveKey
 import com.music.vivi.constants.CrossfadeDurationKey
 import com.music.vivi.constants.CrossfadeEnabledKey
 import com.music.vivi.constants.CrossfadeGaplessKey
@@ -273,6 +275,7 @@ class MusicService :
     private var crossfadeDuration = 5000f
     private var crossfadeGapless = true
     private var crossfadeManualSkipEnabled = false
+    private var crossfadeCurve = CrossfadeCurve.EASE_OUT_QUAD
     private var crossfadeTriggerJob: Job? = null
 
     /** Holds the combined crossfade-related settings emitted from DataStore. */
@@ -281,6 +284,7 @@ class MusicService :
         val durationSeconds: Float,
         val gapless: Boolean,
         val manualSkip: Boolean,
+        val curve: CrossfadeCurve,
     )
 
     /**
@@ -973,6 +977,7 @@ class MusicService :
                     durationSeconds = prefs[CrossfadeDurationKey] ?: 5f,
                     gapless = prefs[CrossfadeGaplessKey] ?: true,
                     manualSkip = prefs[CrossfadeManualSkipKey] ?: false,
+                    curve = prefs[CrossfadeCurveKey].toEnum(CrossfadeCurve.EASE_OUT_QUAD),
                 )
             },
             listenTogetherManager.roomState
@@ -986,6 +991,7 @@ class MusicService :
                 crossfadeDuration = settings.durationSeconds * 1000f // Convert to ms
                 crossfadeGapless = settings.gapless
                 crossfadeManualSkipEnabled = settings.manualSkip
+                crossfadeCurve = settings.curve
             }
 
         if (dataStore.get(PersistentQueueKey, true)) {
@@ -3600,8 +3606,8 @@ class MusicService :
                 }
 
                 val progress = i / steps.toFloat()
-                val fadeIn = 1.0f - (1.0f - progress) * (1.0f - progress)
-                val fadeOut = (1.0f - progress) * (1.0f - progress)
+                val fadeIn = crossfadeCurve.fadeIn(progress)
+                val fadeOut = crossfadeCurve.fadeOut(progress)
 
                 try {
                     player.volume = startVolume * fadeIn

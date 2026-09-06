@@ -46,6 +46,8 @@ import com.music.vivi.constants.EnableSaavnStreamingKey
 import com.music.vivi.constants.SaavnAudioQuality
 import com.music.vivi.constants.SaavnAudioQualityKey
 import com.music.vivi.constants.AutoDownloadOnLikeKey
+import com.music.vivi.constants.CrossfadeCurve
+import com.music.vivi.constants.CrossfadeCurveKey
 import com.music.vivi.constants.CrossfadeDurationKey
 import com.music.vivi.constants.CrossfadeEnabledKey
 import com.music.vivi.constants.CrossfadeGaplessKey
@@ -70,6 +72,7 @@ import com.music.vivi.constants.SkipSilenceInstantKey
 import com.music.vivi.constants.SkipSilenceKey
 import com.music.vivi.constants.StopMusicOnTaskClearKey
 import com.music.vivi.ui.component.ActionPromptDialog
+import com.music.vivi.ui.component.CrossfadeCurvePreview
 import com.music.vivi.ui.component.DefaultDialog
 import com.music.vivi.ui.component.EnumDialog
 import com.music.vivi.ui.component.IconButton
@@ -97,6 +100,10 @@ fun PlayerSettings(
     val (crossfadeDuration, onCrossfadeDurationChange) = rememberPreference(
         CrossfadeDurationKey,
         defaultValue = 5f
+    )
+    val (crossfadeCurve, onCrossfadeCurveChange) = rememberEnumPreference(
+        CrossfadeCurveKey,
+        defaultValue = CrossfadeCurve.EASE_OUT_QUAD
     )
     val (crossfadeGapless, onCrossfadeGaplessChange) = rememberPreference(
         CrossfadeGaplessKey,
@@ -244,6 +251,28 @@ fun PlayerSettings(
             .padding(horizontal = 16.dp)
     ) {
         var showCrossfadeBetaDialog by remember { mutableStateOf(false) }
+        var showCrossfadeCurveDialog by remember { mutableStateOf(false) }
+
+        if (showCrossfadeCurveDialog) {
+            EnumDialog(
+                onDismiss = { showCrossfadeCurveDialog = false },
+                onSelect = {
+                    onCrossfadeCurveChange(it)
+                    showCrossfadeCurveDialog = false
+                },
+                title = stringResource(R.string.crossfade_curve),
+                current = crossfadeCurve,
+                values = CrossfadeCurve.entries,
+                valueText = {
+                    when (it) {
+                        CrossfadeCurve.EQUAL_POWER -> stringResource(R.string.crossfade_curve_entry_equal_power)
+                        CrossfadeCurve.EASE_OUT_QUAD -> stringResource(R.string.crossfade_curve_entry_ease_out_quad)
+                        CrossfadeCurve.EASE_OUT_CUBIC -> stringResource(R.string.crossfade_curve_entry_ease_out_cubic)
+                        CrossfadeCurve.SMOOTHSTEP -> stringResource(R.string.crossfade_curve_entry_smoothstep)
+                    }
+                }
+            )
+        }
 
         if (showCrossfadeBetaDialog) {
             ActionPromptDialog(
@@ -365,6 +394,28 @@ fun PlayerSettings(
                                 )
                             }
                         }
+                    ))
+                    add(Material3SettingsItem(
+                        icon = painterResource(R.drawable.linear_scale),
+                        title = { Text(stringResource(R.string.crossfade_curve)) },
+                        description = {
+                            Column {
+                                Text(
+                                    when (crossfadeCurve) {
+                                        CrossfadeCurve.EQUAL_POWER -> stringResource(R.string.crossfade_curve_entry_equal_power)
+                                        CrossfadeCurve.EASE_OUT_QUAD -> stringResource(R.string.crossfade_curve_entry_ease_out_quad)
+                                        CrossfadeCurve.EASE_OUT_CUBIC -> stringResource(R.string.crossfade_curve_entry_ease_out_cubic)
+                                        CrossfadeCurve.SMOOTHSTEP -> stringResource(R.string.crossfade_curve_entry_smoothstep)
+                                    }
+                                )
+                                Spacer(Modifier.height(8.dp))
+                                CrossfadeCurvePreview(
+                                    curve = crossfadeCurve,
+                                    durationSeconds = crossfadeDuration,
+                                )
+                            }
+                        },
+                        onClick = { showCrossfadeCurveDialog = true }
                     ))
                     add(Material3SettingsItem(
                         icon = painterResource(R.drawable.album),
