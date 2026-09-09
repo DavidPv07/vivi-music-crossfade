@@ -2565,32 +2565,15 @@ class MusicService :
      * [applyShuffleOrder], which regenerates a fresh random order and was the
      * cause of shuffle re-randomizing on every skip / song selection (and of
      * already-played tracks reappearing).
+     *
+     * The actual index math lives in [ShuffleOrderUtils.currentTraversal],
+     * which takes a plain [Timeline] + [Int] instead of a [Player] so it can
+     * be unit-tested with a fake timeline, without needing a real ExoPlayer.
+     * This wrapper just unpacks [sourcePlayer] so every existing call site
+     * here stays unchanged.
      */
-    private fun getCurrentShuffleOrderIndices(sourcePlayer: Player): IntArray? {
-        val timeline = sourcePlayer.currentTimeline
-        if (timeline.isEmpty) return null
-        val currentIndex = sourcePlayer.currentMediaItemIndex
-        if (currentIndex == C.INDEX_UNSET) return null
-
-        val before = mutableListOf<Int>()
-        var prev = currentIndex
-        while (true) {
-            prev = timeline.getPreviousWindowIndex(prev, Player.REPEAT_MODE_OFF, true)
-            if (prev == C.INDEX_UNSET) break
-            before.add(prev)
-        }
-        before.reverse()
-
-        val after = mutableListOf<Int>()
-        var next = currentIndex
-        while (true) {
-            next = timeline.getNextWindowIndex(next, Player.REPEAT_MODE_OFF, true)
-            if (next == C.INDEX_UNSET) break
-            after.add(next)
-        }
-
-        return (before + currentIndex + after).toIntArray()
-    }
+    private fun getCurrentShuffleOrderIndices(sourcePlayer: Player): IntArray? =
+        ShuffleOrderUtils.currentTraversal(sourcePlayer.currentTimeline, sourcePlayer.currentMediaItemIndex)
 
     /**
      * Applies a new shuffle order to the player, maintaining the current item's position.

@@ -230,6 +230,10 @@ dependencies {
     implementation(libs.coroutines.guava)
     implementation(libs.concurrent.futures)
 
+    // Unit tests (app/src/test) — added for ShuffleOrderUtilsTest; other
+    // modules (innertube, canvas, lyricsProvider) already had this.
+    testImplementation(libs.junit)
+
     implementation(libs.activity)
     implementation(libs.hilt.navigation)
     implementation(libs.datastore)
