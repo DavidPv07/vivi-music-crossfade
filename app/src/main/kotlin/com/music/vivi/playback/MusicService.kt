@@ -304,9 +304,12 @@ class MusicService :
     private val secondaryPlayerListener = object : Player.Listener {
         override fun onPlayerError(error: PlaybackException) {
             Timber.tag(TAG).e(error, "Secondary player error")
-            secondaryPlayer?.stop()
-            secondaryPlayer?.clearMediaItems()
-            secondaryPlayer = null
+            // The player that just errored is the one currently reserved for
+            // a crossfade that hasn't swapped in yet — release the whole
+            // reservation (not just the reference) so this failure can't
+            // leave isCrossfading stuck true and block every future
+            // crossfade attempt.
+            releaseCrossfadeReservation("secondaryPlayerListener.onPlayerError")
         }
     }
 
@@ -3692,8 +3695,73 @@ class MusicService :
         return current.albumTitle != null && current.albumTitle == next.albumTitle
     }
 
+    /**
+     * Single gate every crossfade-starting function must pass through before
+     * creating a secondary [ExoPlayer]. Replaces what used to be a duplicated
+     * (and inconsistent — some call sites checked only [isCrossfading], others
+     * also checked `secondaryPlayer != null`) guard spread across
+     * [startCrossfade], [startCrossfadeToIndex], [startQueueCrossfade] and
+     * [startQueueCrossfadeWithPreload].
+     *
+     * On success, marks a crossfade as in-flight ([isCrossfading] = true)
+     * *before* any secondary player is created, closing the previous gap
+     * where a player could be built and left dangling if the caller bailed
+     * out before reaching [performCrossfadeSwap]. Callers that reserve a slot
+     * and then fail to complete the swap (a setup exception, an unmet
+     * precondition discovered late) MUST call [releaseCrossfadeReservation]
+     * so the reservation doesn't block every future crossfade.
+     *
+     * [caller] is only used for the debug log tag so failed reservations are
+     * traceable to whichever entry point lost the race.
+     */
+    private fun reserveCrossfadeSlot(caller: String): Boolean {
+        if (isCrossfading || secondaryPlayer != null) {
+            Timber.tag(TAG).d(
+                "%s: aborting, isCrossfading=%s secondaryPlayer!=null=%s",
+                caller,
+                isCrossfading,
+                secondaryPlayer != null,
+            )
+            return false
+        }
+        isCrossfading = true
+        return true
+    }
+
+    /**
+     * Releases a reservation taken via [reserveCrossfadeSlot] for a caller
+     * that ends up NOT completing the swap — a setup exception, a secondary
+     * player that errored before [performCrossfadeSwap] ran, etc. Guarantees
+     * any half-built secondary player is actually released (not just
+     * dereferenced, avoiding a leaked [ExoPlayer] instance) and that
+     * [isCrossfading] always goes back to `false`, so a failed attempt can
+     * never permanently block future crossfades.
+     *
+     * Must NOT be called once [performCrossfadeSwap] has actually completed
+     * the swap — from that point, [cleanupCrossfade] owns the teardown.
+     */
+    private fun releaseCrossfadeReservation(caller: String) {
+        val reservedPlayer = secondaryPlayer
+        if (reservedPlayer != null) {
+            Timber.tag(TAG).d("%s: releasing reserved secondary player", caller)
+            try {
+                reservedPlayer.removeListener(secondaryPlayerListener)
+                reservedPlayer.stop()
+                reservedPlayer.clearMediaItems()
+                reservedPlayer.release()
+            } catch (e: Exception) {
+                Timber.tag(TAG).e(e, "%s: error releasing secondary player", caller)
+            }
+        }
+        secondaryPlayer = null
+        isCrossfading = false
+    }
+
     private fun startCrossfade(trigger: CrossfadeTrigger = CrossfadeTrigger.AUTO) {
-        if (isCrossfading) return
+        // Cheap early bail so we skip the blocking DataStore reads below when
+        // a crossfade is already in flight. The authoritative check is
+        // reserveCrossfadeSlot(), right before the secondary player is built.
+        if (isCrossfading || secondaryPlayer != null) return
 
         // Preserve player state before creating the secondary player
         // Use runBlocking to ensure we get the correct state from DataStore
@@ -3713,47 +3781,56 @@ class MusicService :
         }
         if (targetIndex == C.INDEX_UNSET) return
 
-        secondaryPlayer = createExoPlayer()
-        val secPlayer = secondaryPlayer!!
-        secPlayer.addListener(secondaryPlayerListener)
+        if (!reserveCrossfadeSlot("startCrossfade")) return
 
-        val itemCount = player.mediaItemCount
-        val items = mutableListOf<MediaItem>()
-        // Copy entire queue history + future
-        for (i in 0 until itemCount) {
-            items.add(player.getMediaItemAt(i))
+        var restoredShuffleOrder = false
+        try {
+            secondaryPlayer = createExoPlayer()
+            val secPlayer = secondaryPlayer!!
+            secPlayer.addListener(secondaryPlayerListener)
+
+            val itemCount = player.mediaItemCount
+            val items = mutableListOf<MediaItem>()
+            // Copy entire queue history + future
+            for (i in 0 until itemCount) {
+                items.add(player.getMediaItemAt(i))
+            }
+
+            // Capture the primary's current shuffle traversal before the swap.
+            // Regenerating a fresh random order here was what caused shuffle to
+            // re-randomize on every skip / song selection.
+            val preservedShuffleOrder =
+                if (savedShuffleEnabled) getCurrentShuffleOrderIndices(player) else null
+
+            secPlayer.setMediaItems(items)
+            // Seek to target track (next track, or current track for repeat-one)
+            secPlayer.seekTo(targetIndex, 0)
+            secPlayer.volume = 0f
+
+            // Copy repeat and shuffle state to the new player
+            secPlayer.repeatMode = savedRepeatMode
+            secPlayer.shuffleModeEnabled = savedShuffleEnabled
+
+            // Replay the captured shuffle order (same items, same order) instead
+            // of generating a new random one. Track whether it was actually applied
+            // so we can fall back to a fresh order below if it wasn't.
+            restoredShuffleOrder = savedShuffleEnabled &&
+                preservedShuffleOrder != null &&
+                preservedShuffleOrder.size == secPlayer.mediaItemCount
+
+            if (restoredShuffleOrder) {
+                secPlayer.setShuffleOrder(
+                    DefaultShuffleOrder(preservedShuffleOrder!!, System.currentTimeMillis())
+                )
+            }
+
+            secPlayer.prepare()
+            secPlayer.playWhenReady = true
+        } catch (e: Exception) {
+            Timber.tag(TAG).e(e, "startCrossfade: failed to set up secondary player")
+            releaseCrossfadeReservation("startCrossfade")
+            return
         }
-
-        // Capture the primary's current shuffle traversal before the swap.
-        // Regenerating a fresh random order here was what caused shuffle to
-        // re-randomize on every skip / song selection.
-        val preservedShuffleOrder =
-            if (savedShuffleEnabled) getCurrentShuffleOrderIndices(player) else null
-
-        secPlayer.setMediaItems(items)
-        // Seek to target track (next track, or current track for repeat-one)
-        secPlayer.seekTo(targetIndex, 0)
-        secPlayer.volume = 0f
-
-        // Copy repeat and shuffle state to the new player
-        secPlayer.repeatMode = savedRepeatMode
-        secPlayer.shuffleModeEnabled = savedShuffleEnabled
-
-        // Replay the captured shuffle order (same items, same order) instead
-        // of generating a new random one. Track whether it was actually applied
-        // so we can fall back to a fresh order below if it wasn't.
-        val restoredShuffleOrder = savedShuffleEnabled &&
-            preservedShuffleOrder != null &&
-            preservedShuffleOrder.size == secPlayer.mediaItemCount
-
-        if (restoredShuffleOrder) {
-            secPlayer.setShuffleOrder(
-                DefaultShuffleOrder(preservedShuffleOrder!!, System.currentTimeMillis())
-            )
-        }
-
-        secPlayer.prepare()
-        secPlayer.playWhenReady = true
 
         performCrossfadeSwap()
 
@@ -3849,46 +3926,56 @@ class MusicService :
      * track can start buffering immediately, then swaps and fades.
      */
     private fun startCrossfadeToIndex(targetIndex: Int) {
-        if (isCrossfading) return
+        // Cheap early bail; reserveCrossfadeSlot() below is the authoritative check.
+        if (isCrossfading || secondaryPlayer != null) return
         if (targetIndex < 0 || targetIndex >= player.mediaItemCount) return
 
         val savedRepeatMode = runBlocking { dataStore.get(RepeatModeKey, REPEAT_MODE_OFF) }
         val savedShuffleEnabled = runBlocking { dataStore.get(ShuffleModeKey, false) }
 
-        secondaryPlayer = createExoPlayer()
-        val secPlayer = secondaryPlayer!!
-        secPlayer.addListener(secondaryPlayerListener)
+        if (!reserveCrossfadeSlot("startCrossfadeToIndex")) return
 
-        val itemCount = player.mediaItemCount
-        val items = mutableListOf<MediaItem>()
-        for (i in 0 until itemCount) {
-            items.add(player.getMediaItemAt(i))
+        var restoredShuffleOrder = false
+        try {
+            secondaryPlayer = createExoPlayer()
+            val secPlayer = secondaryPlayer!!
+            secPlayer.addListener(secondaryPlayerListener)
+
+            val itemCount = player.mediaItemCount
+            val items = mutableListOf<MediaItem>()
+            for (i in 0 until itemCount) {
+                items.add(player.getMediaItemAt(i))
+            }
+
+            // Capture the primary's current shuffle traversal before the swap so we
+            // can replay it on the secondary player instead of re-randomizing.
+            val preservedShuffleOrder =
+                if (savedShuffleEnabled) getCurrentShuffleOrderIndices(player) else null
+
+            secPlayer.setMediaItems(items)
+            secPlayer.seekTo(targetIndex, 0)
+            secPlayer.volume = 0f
+
+            secPlayer.repeatMode = savedRepeatMode
+            secPlayer.shuffleModeEnabled = savedShuffleEnabled
+
+            restoredShuffleOrder = savedShuffleEnabled &&
+                preservedShuffleOrder != null &&
+                preservedShuffleOrder.size == secPlayer.mediaItemCount
+
+            if (restoredShuffleOrder) {
+                secPlayer.setShuffleOrder(
+                    DefaultShuffleOrder(preservedShuffleOrder!!, System.currentTimeMillis())
+                )
+            }
+
+            secPlayer.prepare()
+            secPlayer.playWhenReady = true
+        } catch (e: Exception) {
+            Timber.tag(TAG).e(e, "startCrossfadeToIndex: failed to set up secondary player")
+            releaseCrossfadeReservation("startCrossfadeToIndex")
+            return
         }
-
-        // Capture the primary's current shuffle traversal before the swap so we
-        // can replay it on the secondary player instead of re-randomizing.
-        val preservedShuffleOrder =
-            if (savedShuffleEnabled) getCurrentShuffleOrderIndices(player) else null
-
-        secPlayer.setMediaItems(items)
-        secPlayer.seekTo(targetIndex, 0)
-        secPlayer.volume = 0f
-
-        secPlayer.repeatMode = savedRepeatMode
-        secPlayer.shuffleModeEnabled = savedShuffleEnabled
-
-        val restoredShuffleOrder = savedShuffleEnabled &&
-            preservedShuffleOrder != null &&
-            preservedShuffleOrder.size == secPlayer.mediaItemCount
-
-        if (restoredShuffleOrder) {
-            secPlayer.setShuffleOrder(
-                DefaultShuffleOrder(preservedShuffleOrder!!, System.currentTimeMillis())
-            )
-        }
-
-        secPlayer.prepare()
-        secPlayer.playWhenReady = true
 
         performCrossfadeSwap()
 
@@ -3915,14 +4002,7 @@ class MusicService :
         status: Queue.Status,
         persistShuffleAcrossQueues: Boolean,
     ): Boolean {
-        if (isCrossfading || secondaryPlayer != null) {
-            Timber.tag(TAG).d(
-                "startQueueCrossfade: aborting, isCrossfading=%s secondaryPlayer!=null=%s",
-                isCrossfading,
-                secondaryPlayer != null,
-            )
-            return false
-        }
+        if (!reserveCrossfadeSlot("startQueueCrossfade")) return false
 
         val savedRepeatMode = runBlocking { dataStore.get(RepeatModeKey, REPEAT_MODE_OFF) }
         val targetIndex = if (status.mediaItemIndex > 0) status.mediaItemIndex else 0
@@ -3937,26 +4017,33 @@ class MusicService :
         val preservedShuffleOrder =
             if (carryingShuffle && sameQueue) getCurrentShuffleOrderIndices(player) else null
 
-        secondaryPlayer = createExoPlayer()
-        val secPlayer = secondaryPlayer!!
-        secPlayer.addListener(secondaryPlayerListener)
+        var restoredShuffleOrder = false
+        try {
+            secondaryPlayer = createExoPlayer()
+            val secPlayer = secondaryPlayer!!
+            secPlayer.addListener(secondaryPlayerListener)
 
-        secPlayer.setMediaItems(status.items, targetIndex, status.position)
-        secPlayer.volume = 0f
-        secPlayer.repeatMode = savedRepeatMode
-        secPlayer.shuffleModeEnabled = carryingShuffle
+            secPlayer.setMediaItems(status.items, targetIndex, status.position)
+            secPlayer.volume = 0f
+            secPlayer.repeatMode = savedRepeatMode
+            secPlayer.shuffleModeEnabled = carryingShuffle
 
-        val restoredShuffleOrder = carryingShuffle && preservedShuffleOrder != null &&
-            preservedShuffleOrder.size == secPlayer.mediaItemCount
+            restoredShuffleOrder = carryingShuffle && preservedShuffleOrder != null &&
+                preservedShuffleOrder.size == secPlayer.mediaItemCount
 
-        if (restoredShuffleOrder) {
-            secPlayer.setShuffleOrder(
-                DefaultShuffleOrder(preservedShuffleOrder!!, System.currentTimeMillis())
-            )
+            if (restoredShuffleOrder) {
+                secPlayer.setShuffleOrder(
+                    DefaultShuffleOrder(preservedShuffleOrder!!, System.currentTimeMillis())
+                )
+            }
+
+            secPlayer.prepare()
+            secPlayer.playWhenReady = true
+        } catch (e: Exception) {
+            Timber.tag(TAG).e(e, "startQueueCrossfade: failed to set up secondary player")
+            releaseCrossfadeReservation("startQueueCrossfade")
+            return false
         }
-
-        secPlayer.prepare()
-        secPlayer.playWhenReady = true
 
         performCrossfadeSwap()
 
@@ -3991,28 +4078,27 @@ class MusicService :
         persistShuffleAcrossQueues: Boolean,
     ): Boolean {
         val preloadItem = queue.preloadItem ?: return false
-        if (isCrossfading || secondaryPlayer != null) {
-            Timber.tag(TAG).d(
-                "startQueueCrossfadeWithPreload: aborting, isCrossfading=%s secondaryPlayer!=null=%s",
-                isCrossfading,
-                secondaryPlayer != null,
-            )
-            return false
-        }
+        if (!reserveCrossfadeSlot("startQueueCrossfadeWithPreload")) return false
 
         val savedRepeatMode = runBlocking { dataStore.get(RepeatModeKey, REPEAT_MODE_OFF) }
 
-        secondaryPlayer = createExoPlayer()
-        val secPlayer = secondaryPlayer!!
-        secPlayer.addListener(secondaryPlayerListener)
+        try {
+            secondaryPlayer = createExoPlayer()
+            val secPlayer = secondaryPlayer!!
+            secPlayer.addListener(secondaryPlayerListener)
 
-        secPlayer.setMediaItem(preloadItem.toMediaItem())
-        secPlayer.volume = 0f
-        secPlayer.repeatMode = savedRepeatMode
-        secPlayer.shuffleModeEnabled = persistShuffleAcrossQueues && player.shuffleModeEnabled
+            secPlayer.setMediaItem(preloadItem.toMediaItem())
+            secPlayer.volume = 0f
+            secPlayer.repeatMode = savedRepeatMode
+            secPlayer.shuffleModeEnabled = persistShuffleAcrossQueues && player.shuffleModeEnabled
 
-        secPlayer.prepare()
-        secPlayer.playWhenReady = true
+            secPlayer.prepare()
+            secPlayer.playWhenReady = true
+        } catch (e: Exception) {
+            Timber.tag(TAG).e(e, "startQueueCrossfadeWithPreload: failed to set up secondary player")
+            releaseCrossfadeReservation("startQueueCrossfadeWithPreload")
+            return false
+        }
 
         Timber.tag(TAG).d("startQueueCrossfadeWithPreload: starting crossfade into preload item")
         performCrossfadeSwap()
@@ -4026,8 +4112,20 @@ class MusicService :
     }
 
     private fun performCrossfadeSwap() {
-        isCrossfading = true
-        val nextPlayer = secondaryPlayer ?: return
+        // isCrossfading is already true from reserveCrossfadeSlot(). This null
+        // check is now a defensive safety net rather than the primary guard:
+        // previously this function set isCrossfading = true unconditionally
+        // *before* checking secondaryPlayer, so if the secondary player had
+        // already been invalidated (e.g. a playback error right before the
+        // swap), the function returned here with isCrossfading stuck true
+        // forever, silently blocking every future crossfade until the
+        // service restarted.
+        val nextPlayer = secondaryPlayer
+        if (nextPlayer == null) {
+            Timber.tag(TAG).e("performCrossfadeSwap: no secondary player to swap in, releasing reservation")
+            isCrossfading = false
+            return
+        }
         val currentPlayer = player
 
         fadingPlayer = currentPlayer
