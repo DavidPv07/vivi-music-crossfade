@@ -4122,8 +4122,46 @@ class MusicService :
 
             for (i in 0..steps) {
                 if (!isActive) break
-                // Pause volume ramp if player is paused
+                // Pause volume ramp if player is paused or still buffering.
+                //
+                // waitedMs only accumulates while playWhenReady is true (the
+                // player is actively trying to play but can't yet — e.g.
+                // still buffering right after the swap), so a user who
+                // deliberately pauses mid-crossfade can wait indefinitely
+                // without tripping the timeout below. Without this bound, a
+                // player that never reaches STATE_READY — a stalled buffer,
+                // lost network, or a playback error right after the swap —
+                // left isCrossfading stuck true forever, since nothing else
+                // ever cancels or times out crossfadeJob. Same class of bug
+                // the pre-swap reservation gate fixed, but on the post-swap
+                // side.
+                var waitedMs = 0L
                 while (!player.isPlaying && isActive) {
+                    if (player.playbackState == Player.STATE_IDLE ||
+                        player.playbackState == Player.STATE_ENDED
+                    ) {
+                        Timber.tag(TAG).e(
+                            "crossfadeJob: new player reached %s while waiting to fade in, finishing crossfade immediately",
+                            if (player.playbackState == Player.STATE_IDLE) "STATE_IDLE" else "STATE_ENDED",
+                        )
+                        finishCrossfadeImmediately(startVolume)
+                        return@launch
+                    }
+                    if (player.playWhenReady) {
+                        waitedMs += 100
+                        if (waitedMs >= CROSSFADE_BUFFERING_TIMEOUT_MS) {
+                            Timber.tag(TAG).e(
+                                "crossfadeJob: timed out after %dms waiting for new player to start playing, finishing crossfade immediately",
+                                CROSSFADE_BUFFERING_TIMEOUT_MS,
+                            )
+                            finishCrossfadeImmediately(startVolume)
+                            return@launch
+                        }
+                    } else {
+                        // Genuinely paused by the user, not stuck — don't
+                        // count this time against the buffering timeout.
+                        waitedMs = 0L
+                    }
                     delay(100)
                 }
 
@@ -4146,6 +4184,22 @@ class MusicService :
             } catch (e: Exception) { }
         }
         return true
+    }
+
+    /**
+     * Bails out of an in-flight crossfade fade when the new primary player
+     * can't be waited on any longer — it errored out or timed out buffering
+     * after the swap already happened, so there's no "undo the swap" option.
+     * Snaps volumes to their end state instead of leaving the new player
+     * silent or the old one lingering, then tears down exactly like a normal
+     * fade completion so [isCrossfading] always gets reset.
+     */
+    private fun finishCrossfadeImmediately(startVolume: Float) {
+        try {
+            fadingPlayer?.volume = 0f
+            player.volume = startVolume
+        } catch (e: Exception) { }
+        cleanupCrossfade()
     }
 
     private fun cleanupCrossfade() {
@@ -4176,6 +4230,12 @@ class MusicService :
         const val PERSISTENT_PLAYER_STATE_FILE = "persistent_player_state.data"
         const val MAX_CONSECUTIVE_ERR = 5
         const val MAX_RETRY_COUNT = 10
+        // How long the crossfade fade loop will wait for the new primary
+        // player to actually start playing (e.g. finish buffering) before
+        // giving up and finishing the crossfade immediately instead of
+        // spinning forever. See the comment in performCrossfadeSwap's
+        // crossfadeJob for why this matters.
+        private const val CROSSFADE_BUFFERING_TIMEOUT_MS = 15_000L
         // Constants for audio normalization
         private const val MAX_GAIN_MB = 300 // Maximum gain in millibels (3 dB)
         private const val MIN_GAIN_MB = -1500 // Minimum gain in millibels (-15 dB)
