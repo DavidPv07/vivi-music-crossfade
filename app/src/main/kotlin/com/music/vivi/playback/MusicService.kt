@@ -3676,7 +3676,17 @@ class MusicService :
         crossfadeTriggerJob = null
         if (!crossfadeEnabled || player.duration == C.TIME_UNSET || player.duration <= crossfadeDuration) return
         if (crossfadeGapless && isNextItemGapless()) return
-        if (!player.hasNextMediaItem() && player.repeatMode != REPEAT_MODE_ONE) return
+        // Repeat-one loops the *same* track back into itself at its natural
+        // end. Crossfading a track into itself sounds like the tail of the
+        // song playing underneath its own intro — closer to a glitch than a
+        // musical effect for most songs — so skip scheduling entirely and
+        // let ExoPlayer's own repeat-one handling do a clean, instant loop
+        // instead. This only affects the natural-end-of-track case: a manual
+        // skip, or a queue that happens to contain the same song twice as
+        // separate entries, is a normal A→B transition between two different
+        // queue positions and still crossfades as usual.
+        if (player.repeatMode == REPEAT_MODE_ONE) return
+        if (!player.hasNextMediaItem()) return
 
         val triggerTime = player.duration - crossfadeDuration.toLong()
         val delayMs = triggerTime - player.currentPosition
@@ -3869,7 +3879,9 @@ class MusicService :
             if (savedShuffleEnabled) getCurrentShuffleOrderIndices(player) else null
 
         secPlayer.setMediaItems(items)
-        // Seek to target track (next track, or current track for repeat-one)
+        // Seek to the target track (next track, or previous track for a
+        // manual "previous" skip). Repeat-one never reaches here — see
+        // scheduleCrossfade and startCrossfade.
         secPlayer.seekTo(targetIndex, 0)
         secPlayer.repeatMode = savedRepeatMode
         secPlayer.shuffleModeEnabled = savedShuffleEnabled
@@ -3894,8 +3906,13 @@ class MusicService :
                 if (!player.hasPreviousMediaItem()) return
                 player.previousMediaItemIndex
             }
-            // For repeat-one at the natural end of the track, crossfade back into the same track.
-            trigger == CrossfadeTrigger.AUTO && savedRepeatMode == REPEAT_MODE_ONE -> player.currentMediaItemIndex
+            // Repeat-one at the natural end of the track: don't crossfade a
+            // track into itself (see scheduleCrossfade). This only fires in
+            // the rare case where repeat mode changed to ONE after this
+            // AUTO trigger was already scheduled under a different mode —
+            // scheduleCrossfade's own repeat-one check normally prevents the
+            // trigger from being scheduled at all.
+            trigger == CrossfadeTrigger.AUTO && savedRepeatMode == REPEAT_MODE_ONE -> return
             // Natural end-of-track advance, or a manual "next" skip.
             else -> player.nextMediaItemIndex
         }
