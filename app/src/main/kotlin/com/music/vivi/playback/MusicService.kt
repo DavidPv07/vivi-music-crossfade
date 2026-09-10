@@ -3476,6 +3476,28 @@ class MusicService :
     override fun onDestroy() {
         isRunning = false
 
+        // Tear down any in-flight crossfade before anything else. `scope`
+        // (where crossfadeJob / crossfadeTriggerJob run) is never cancelled
+        // anywhere in this class, so without this, a crossfade that's
+        // mid-fade (fadingPlayer still holding the old ExoPlayer) or
+        // mid-swap (secondaryPlayer still being prepared) when the service
+        // is destroyed would leak that extra ExoPlayer instance instead of
+        // releasing it. Safe to call unconditionally — releasing an
+        // already-null player via `?.` is a no-op.
+        crossfadeTriggerJob?.cancel()
+        crossfadeTriggerJob = null
+        crossfadeJob?.cancel()
+        crossfadeJob = null
+        releaseCrossfadeReservation("onDestroy")
+        try {
+            fadingPlayer?.stop()
+            fadingPlayer?.clearMediaItems()
+            fadingPlayer?.release()
+        } catch (e: Exception) {
+            Timber.tag(TAG).e(e, "onDestroy: error releasing fadingPlayer")
+        }
+        fadingPlayer = null
+
         try {
             unregisterReceiver(screenStateReceiver)
         } catch (e: Exception) {
