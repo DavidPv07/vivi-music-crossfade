@@ -3964,24 +3964,24 @@ class MusicService :
      * sequence; they now differ only in *which* media items go on the
      * secondary player, supplied via [configure].
      *
-     * [caller] identifies the entry point in logs. [durationMs] is the fade
-     * length to use for this specific crossfade — callers pass the AUTO
-     * end-of-track duration or the (possibly different) manual-skip duration
-     * depending on why this crossfade is starting; see [performCrossfadeSwap].
+     * [caller] identifies the entry point in logs. [plan] is the transition
+     * plan to execute — see [TransitionPlan] for what each field controls and
+     * why the crossfade engine only ever reads a plan, never raw settings.
      * [configure] receives the freshly created secondary player, is
      * responsible for loading its media item(s) (`setMediaItem`/`setMediaItems`
-     * + any seek) and setting `repeatMode` / `shuffleModeEnabled` on it, and
-     * returns a [ShuffleSetup] describing what to do about shuffle order
-     * afterward. Any exception thrown during setup (by [configure] or by this
-     * function) is caught, logged, and turned into a released reservation
-     * instead of a half-built secondary player.
+     * + any seek — typically to `plan.incomingPositionMs`) and setting
+     * `repeatMode` / `shuffleModeEnabled` on it, and returns a [ShuffleSetup]
+     * describing what to do about shuffle order afterward. Any exception
+     * thrown during setup (by [configure] or by this function) is caught,
+     * logged, and turned into a released reservation instead of a half-built
+     * secondary player.
      *
      * Returns `true` only if the secondary player was actually swapped in as
      * the new primary player.
      */
     private fun beginCrossfadeSwap(
         caller: String,
-        durationMs: Long,
+        plan: TransitionPlan,
         configure: (ExoPlayer) -> ShuffleSetup,
     ): Boolean {
         if (!reserveCrossfadeSlot(caller)) return false
@@ -4022,8 +4022,12 @@ class MusicService :
             return false
         }
 
-        Timber.tag(TAG).d("%s: secondary player ready, starting swap (durationMs=%d)", caller, durationMs)
-        if (!performCrossfadeSwap(durationMs)) return false
+        Timber.tag(TAG).d(
+            "%s: secondary player ready, starting swap (plan=%s)",
+            caller,
+            plan,
+        )
+        if (!performCrossfadeSwap(plan)) return false
 
         // If shuffle is on but the order wasn't carried over (a genuinely
         // different queue, a same-queue size mismatch, or a preload item with
@@ -4047,6 +4051,7 @@ class MusicService :
         targetIndex: Int,
         savedRepeatMode: Int,
         savedShuffleEnabled: Boolean,
+        incomingPositionMs: Long,
     ): ShuffleSetup {
         val itemCount = player.mediaItemCount
         val items = mutableListOf<MediaItem>()
@@ -4063,9 +4068,10 @@ class MusicService :
 
         secPlayer.setMediaItems(items)
         // Seek to the target track (next track, or previous track for a
-        // manual "previous" skip). Repeat-one never reaches here — see
-        // scheduleCrossfade and startCrossfade.
-        secPlayer.seekTo(targetIndex, 0)
+        // manual "previous" skip) at the position the transition plan calls
+        // for — every current caller passes 0 here. Repeat-one never reaches
+        // this function — see scheduleCrossfade and startCrossfade.
+        secPlayer.seekTo(targetIndex, incomingPositionMs)
         secPlayer.repeatMode = savedRepeatMode
         secPlayer.shuffleModeEnabled = savedShuffleEnabled
 
@@ -4112,9 +4118,15 @@ class MusicService :
             CrossfadeTrigger.AUTO -> crossfadeDuration.toLong()
             CrossfadeTrigger.MANUAL_NEXT, CrossfadeTrigger.MANUAL_PREVIOUS -> manualCrossfadeDuration.toLong()
         }
+        val plan = TransitionPlan(
+            durationMs = durationMs,
+            outgoingPositionMs = player.currentPosition,
+            incomingPositionMs = 0L,
+            curve = crossfadeCurve,
+        )
 
-        beginCrossfadeSwap("startCrossfade", durationMs) { secPlayer ->
-            setupSecondaryFromPrimaryQueue(secPlayer, targetIndex, savedRepeatMode, savedShuffleEnabled)
+        beginCrossfadeSwap("startCrossfade", plan) { secPlayer ->
+            setupSecondaryFromPrimaryQueue(secPlayer, targetIndex, savedRepeatMode, savedShuffleEnabled, plan.incomingPositionMs)
         }
     }
 
@@ -4209,8 +4221,15 @@ class MusicService :
         val savedRepeatMode = runBlocking { dataStore.get(RepeatModeKey, REPEAT_MODE_OFF) }
         val savedShuffleEnabled = runBlocking { dataStore.get(ShuffleModeKey, false) }
 
-        beginCrossfadeSwap("startCrossfadeToIndex", manualCrossfadeDuration.toLong()) { secPlayer ->
-            setupSecondaryFromPrimaryQueue(secPlayer, targetIndex, savedRepeatMode, savedShuffleEnabled)
+        val plan = TransitionPlan(
+            durationMs = manualCrossfadeDuration.toLong(),
+            outgoingPositionMs = player.currentPosition,
+            incomingPositionMs = 0L,
+            curve = crossfadeCurve,
+        )
+
+        beginCrossfadeSwap("startCrossfadeToIndex", plan) { secPlayer ->
+            setupSecondaryFromPrimaryQueue(secPlayer, targetIndex, savedRepeatMode, savedShuffleEnabled, plan.incomingPositionMs)
         }
     }
 
@@ -4248,8 +4267,19 @@ class MusicService :
         val preservedShuffleOrder =
             if (carryingShuffle && sameQueue) getCurrentShuffleOrderIndices(player) else null
 
-        return beginCrossfadeSwap("startQueueCrossfade", manualCrossfadeDuration.toLong()) { secPlayer ->
-            secPlayer.setMediaItems(status.items, targetIndex, status.position)
+        val plan = TransitionPlan(
+            durationMs = manualCrossfadeDuration.toLong(),
+            outgoingPositionMs = player.currentPosition,
+            // Not 0 like the other manual entry points: this resumes a
+            // synced/saved queue position (e.g. Listen Together), so the
+            // incoming player needs to start from wherever that queue said
+            // to, not from the beginning of the track.
+            incomingPositionMs = status.position,
+            curve = crossfadeCurve,
+        )
+
+        return beginCrossfadeSwap("startQueueCrossfade", plan) { secPlayer ->
+            secPlayer.setMediaItems(status.items, targetIndex, plan.incomingPositionMs)
             secPlayer.repeatMode = savedRepeatMode
             secPlayer.shuffleModeEnabled = carryingShuffle
             ShuffleSetup(carryingShuffle, preservedShuffleOrder)
@@ -4284,8 +4314,15 @@ class MusicService :
 
         val savedRepeatMode = runBlocking { dataStore.get(RepeatModeKey, REPEAT_MODE_OFF) }
 
-        return beginCrossfadeSwap("startQueueCrossfadeWithPreload", manualCrossfadeDuration.toLong()) { secPlayer ->
-            secPlayer.setMediaItem(preloadItem.toMediaItem())
+        val plan = TransitionPlan(
+            durationMs = manualCrossfadeDuration.toLong(),
+            outgoingPositionMs = player.currentPosition,
+            incomingPositionMs = 0L,
+            curve = crossfadeCurve,
+        )
+
+        return beginCrossfadeSwap("startQueueCrossfadeWithPreload", plan) { secPlayer ->
+            secPlayer.setMediaItem(preloadItem.toMediaItem(), plan.incomingPositionMs)
             secPlayer.repeatMode = savedRepeatMode
             val shuffleEnabled = persistShuffleAcrossQueues && player.shuffleModeEnabled
             secPlayer.shuffleModeEnabled = shuffleEnabled
@@ -4296,7 +4333,7 @@ class MusicService :
         }
     }
 
-    private fun performCrossfadeSwap(durationMs: Long): Boolean {
+    private fun performCrossfadeSwap(plan: TransitionPlan): Boolean {
         // isCrossfading is already true from reserveCrossfadeSlot(). This null
         // check is now a defensive safety net rather than the primary guard:
         // previously this function set isCrossfading = true unconditionally
@@ -4358,7 +4395,7 @@ class MusicService :
         }
 
         crossfadeJob = scope.launch {
-            val duration = durationMs
+            val duration = plan.durationMs
             val steps = 20
             val stepTime = duration / steps
             // Seed the live base volume from the outgoing player's current
@@ -4416,8 +4453,8 @@ class MusicService :
                 }
 
                 val progress = i / steps.toFloat()
-                val fadeIn = crossfadeCurve.fadeIn(progress)
-                val fadeOut = crossfadeCurve.fadeOut(progress)
+                val fadeIn = plan.curve.fadeIn(progress)
+                val fadeOut = plan.curve.fadeOut(progress)
 
                 try {
                     player.volume = crossfadeBaseVolume * fadeIn
