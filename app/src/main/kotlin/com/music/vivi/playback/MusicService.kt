@@ -1197,6 +1197,21 @@ class MusicService :
                 }
                 addAnalyticsListener(PlaybackStatsListener(false, this@MusicService))
 
+                // Reapply the user's previously chosen audio output device (if
+                // any) to this newly built player. Without this, every fresh
+                // ExoPlayer — including the secondary player built for a
+                // crossfade — silently falls back to the system's default
+                // output instead of the device the user picked (e.g. one of
+                // several connected Bluetooth outputs), so a crossfade could
+                // briefly play the incoming track from a different physical
+                // output than the outgoing one.
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    preferredDeviceId?.let { deviceId ->
+                        val devices = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+                        setPreferredAudioDevice(devices.find { it.id == deviceId })
+                    }
+                }
+
                 // Cleanup handled manually in onDestroy/release
             }
         _playerFlow.value = player
