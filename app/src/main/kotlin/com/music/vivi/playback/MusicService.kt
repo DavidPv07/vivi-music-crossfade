@@ -353,14 +353,40 @@ class MusicService :
         val newMutedState = !isMuted.value
         isMuted.value = newMutedState
         // Immediately update player volume to ensure it takes effect
-        player.volume = if (newMutedState) 0f else playerVolume.value
+        applyBaseVolume(if (newMutedState) 0f else playerVolume.value)
     }
 
     fun setMuted(muted: Boolean) {
         isMuted.value = muted
         // Immediately update player volume to ensure it takes effect
         // This handles cases where the player reference may have changed
-        player.volume = if (muted) 0f else playerVolume.value
+        applyBaseVolume(if (muted) 0f else playerVolume.value)
+    }
+
+    /**
+     * Single choke point for "what should playback volume be right now,
+     * ignoring the crossfade fade curve" — the volume slider, mute, and
+     * audio-focus ducking all funnel through here instead of writing
+     * `player.volume` directly.
+     *
+     * Outside a crossfade this just sets `player.volume`, same as before.
+     * During an active crossfade, [performCrossfadeSwap]'s fade ramp is the
+     * sole owner of both players' actual volume (it multiplies this value by
+     * the fade-in/fade-out curve on every step) — writing `player.volume`
+     * directly here would get silently overwritten on the ramp's next tick,
+     * and would never reach `fadingPlayer` at all, so e.g. a phone-call
+     * ducking event mid-crossfade only ducked the incoming track for a
+     * fraction of a second before the ramp undid it, leaving the outgoing
+     * track blaring the whole time. Storing it in [crossfadeBaseVolume]
+     * instead lets the ramp apply it to both players, scaled correctly, on
+     * its very next step.
+     */
+    private fun applyBaseVolume(volume: Float) {
+        if (isCrossfading) {
+            crossfadeBaseVolume = volume
+        } else {
+            player.volume = volume
+        }
     }
 
     fun setPreferredAudioDevice(deviceId: Int?) { // this helps us to change between devices
@@ -389,6 +415,14 @@ class MusicService :
     private var fadingPlayer: ExoPlayer? = null
     private var isCrossfading = false
     private var crossfadeJob: Job? = null
+    // The user's desired volume (slider * !muted, or a ducked value from audio
+    // focus loss), independent of the crossfade fade curve. Outside a
+    // crossfade this is applied straight to `player.volume`; during one, the
+    // fade ramp in performCrossfadeSwap() is the sole owner of both players'
+    // volume (it multiplies this by the fade-in/fade-out curve each step), so
+    // mute/ducking/slider changes update this instead of writing player.volume
+    // directly — see applyBaseVolume().
+    private var crossfadeBaseVolume: Float = 1f
 
     private lateinit var mediaSession: MediaLibrarySession
 
@@ -407,6 +441,18 @@ class MusicService :
 
     private var isAudioEffectSessionOpened = false
     private var loudnessEnhancer: LoudnessEnhancer? = null
+
+    // During a crossfade, two ExoPlayer instances play simultaneously, each on
+    // its own audio session — and LoudnessEnhancer is bound to a session, not
+    // to our `player` var. `secondaryLoudnessEnhancer` normalizes the incoming
+    // track on the secondary player while it fades in; `fadingLoudnessEnhancer`
+    // keeps normalizing the outgoing track (the former `loudnessEnhancer`) for
+    // the remainder of the fade after performCrossfadeSwap() promotes the
+    // secondary one to be the new primary `loudnessEnhancer`. Without these,
+    // the incoming track played unnormalized for the whole overlap, so two
+    // songs of different loudness sounded lopsided mid-crossfade.
+    private var secondaryLoudnessEnhancer: LoudnessEnhancer? = null
+    private var fadingLoudnessEnhancer: LoudnessEnhancer? = null
 
     private var discordRpc: DiscordRPC? = null
     private var lastPlaybackSpeed = 1.0f
@@ -725,7 +771,7 @@ class MusicService :
         combine(playerVolume, isMuted) { volume, muted ->
             if (muted) 0f else volume
         }.collectLatest(scope) {
-            player.volume = it
+            applyBaseVolume(it)
         }
 
         playerVolume.debounce(1000).collect(scope) { volume ->
@@ -1194,7 +1240,7 @@ class MusicService :
                     }
                 }
 
-                player.volume = if (isMuted.value) 0f else playerVolume.value
+                applyBaseVolume(if (isMuted.value) 0f else playerVolume.value)
                 lastAudioFocusState = focusChange
             }
 
@@ -1221,14 +1267,14 @@ class MusicService :
                 hasAudioFocus = false
                 wasPlayingBeforeAudioFocusLoss = player.isPlaying
                 if (player.isPlaying) {
-                    player.volume = if (isMuted.value) 0f else (playerVolume.value * 0.2f)
+                    applyBaseVolume(if (isMuted.value) 0f else (playerVolume.value * 0.2f))
                 }
                 lastAudioFocusState = focusChange
             }
 
             AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK -> {
                 hasAudioFocus = true
-                player.volume = if (isMuted.value) 0f else playerVolume.value
+                applyBaseVolume(if (isMuted.value) 0f else playerVolume.value)
                 lastAudioFocusState = focusChange
             }
         }
@@ -2150,52 +2196,133 @@ class MusicService :
                     player.currentMediaItem?.mediaId
                 }
 
-                val normalizeAudio = withContext(Dispatchers.IO) {
-                    dataStore.data.map { it[AudioNormalizationKey] ?: true }.first()
-                }
+                val clampedGain = computeNormalizationGainMb(currentMediaId)
 
-                if (normalizeAudio && currentMediaId != null) {
-                    val format = withContext(Dispatchers.IO) {
-                        database.format(currentMediaId).first()
-                    }
-
-                    Timber.tag(TAG).d("Audio normalization enabled: $normalizeAudio")
-                    Timber.tag(TAG).d("Format loudnessDb: ${format?.loudnessDb}, perceptualLoudnessDb: ${format?.perceptualLoudnessDb}")
-
-                    // Use loudnessDb if available, otherwise fall back to perceptualLoudnessDb
-                    val loudness = format?.loudnessDb ?: format?.perceptualLoudnessDb
-
-                    withContext(Dispatchers.Main) {
-                        if (loudness != null) {
-                            val loudnessDb = loudness.toFloat()
-                            val targetGain = (-loudnessDb * 100).toInt()
-                            val clampedGain = targetGain.coerceIn(MIN_GAIN_MB, MAX_GAIN_MB)
-
-                            Timber.tag(TAG).d("Calculated raw normalization gain: $targetGain mB (from loudness: $loudnessDb)")
-
-                            try {
-                                loudnessEnhancer?.setTargetGain(clampedGain)
-                                loudnessEnhancer?.enabled = true
-                                Timber.tag(TAG).i("LoudnessEnhancer gain applied: $clampedGain mB")
-                            } catch (e: Exception) {
-                                Timber.tag(TAG).e(e, "Failed to apply loudness enhancement")
-                                reportException(e)
-                                releaseLoudnessEnhancer()
-                            }
-                        } else {
-                            loudnessEnhancer?.enabled = false
-                            Timber.tag(TAG).w("Normalization enabled but no loudness data available - no normalization applied")
+                withContext(Dispatchers.Main) {
+                    if (clampedGain != null) {
+                        try {
+                            loudnessEnhancer?.setTargetGain(clampedGain)
+                            loudnessEnhancer?.enabled = true
+                            Timber.tag(TAG).i("LoudnessEnhancer gain applied: $clampedGain mB")
+                        } catch (e: Exception) {
+                            Timber.tag(TAG).e(e, "Failed to apply loudness enhancement")
+                            reportException(e)
+                            releaseLoudnessEnhancer()
                         }
-                    }
-                } else {
-                    withContext(Dispatchers.Main) {
+                    } else {
                         loudnessEnhancer?.enabled = false
-                        Timber.tag(TAG).d("setupLoudnessEnhancer: normalization disabled or mediaId unavailable")
+                        Timber.tag(TAG).d("setupLoudnessEnhancer: normalization disabled, mediaId unavailable, or no loudness data")
                     }
                 }
             } catch (e: Exception) {
                 reportException(e)
                 releaseLoudnessEnhancer()
+            }
+        }
+    }
+
+    /**
+     * Shared by [setupLoudnessEnhancer] (primary player) and
+     * [setupSecondaryLoudnessEnhancer] (the incoming crossfade player) so both
+     * sides of a crossfade compute the gain the same way. Returns the clamped
+     * [LoudnessEnhancer] target gain in millibels for [mediaId], or `null` if
+     * normalization is turned off in settings or no loudness data is stored
+     * for the track (in which case the caller should leave normalization off
+     * rather than guess).
+     */
+    private suspend fun computeNormalizationGainMb(mediaId: String?): Int? {
+        if (mediaId == null) return null
+
+        val normalizeAudio = withContext(Dispatchers.IO) {
+            dataStore.data.map { it[AudioNormalizationKey] ?: true }.first()
+        }
+        if (!normalizeAudio) return null
+
+        val format = withContext(Dispatchers.IO) {
+            database.format(mediaId).first()
+        }
+
+        // Use loudnessDb if available, otherwise fall back to perceptualLoudnessDb
+        val loudness = format?.loudnessDb ?: format?.perceptualLoudnessDb ?: return null
+
+        val loudnessDb = loudness.toFloat()
+        val targetGain = (-loudnessDb * 100).toInt()
+        Timber.tag(TAG).d("Calculated raw normalization gain: $targetGain mB (from loudness: $loudnessDb, mediaId: $mediaId)")
+        return targetGain.coerceIn(MIN_GAIN_MB, MAX_GAIN_MB)
+    }
+
+    /**
+     * Prepares loudness normalization for the secondary player during a
+     * crossfade, so the incoming track is already gain-matched to its
+     * declared loudness by the time (or shortly after) the fade starts —
+     * instead of playing unnormalized until its own first natural
+     * [onMediaItemTransition] fires [setupLoudnessEnhancer] again, well after
+     * the swap. Mirrors [setupLoudnessEnhancer] but targets [secPlayer]'s own
+     * audio session and writes into [secondaryLoudnessEnhancer] rather than
+     * the primary [loudnessEnhancer] — unless [performCrossfadeSwap] has
+     * already run by the time this finishes (see below), which in practice is
+     * the common case since that swap happens synchronously right after this
+     * is kicked off, well before the session-id poll or DB lookup can finish.
+     *
+     * The secondary player's audio session id isn't assigned until its
+     * renderer initializes, which races with `prepare()`, so this polls
+     * briefly rather than giving up immediately the way [setupLoudnessEnhancer]
+     * does for the primary player (which gets retried on later lifecycle
+     * events; the secondary player only gets this one window before the fade
+     * completes).
+     */
+    private fun setupSecondaryLoudnessEnhancer(secPlayer: ExoPlayer, targetMediaId: String?) {
+        // A crossfade "belongs" to secPlayer as long as it's either still the
+        // waiting secondary player, or has already been promoted to primary by
+        // performCrossfadeSwap(). Only a NEWER crossfade replacing this one
+        // (or a released reservation) makes secPlayer stale.
+        fun isStillRelevant() = secondaryPlayer === secPlayer || player === secPlayer
+
+        scope.launch {
+            var audioSessionId = secPlayer.audioSessionId
+            var attempts = 0
+            while (audioSessionId == C.AUDIO_SESSION_ID_UNSET && attempts < 20 && isStillRelevant()) {
+                delay(50)
+                audioSessionId = secPlayer.audioSessionId
+                attempts++
+            }
+            if (audioSessionId == C.AUDIO_SESSION_ID_UNSET || !isStillRelevant()) {
+                if (audioSessionId == C.AUDIO_SESSION_ID_UNSET) {
+                    Timber.tag(TAG).w("setupSecondaryLoudnessEnhancer: session never became ready, incoming track will play unnormalized")
+                }
+                return@launch
+            }
+
+            val clampedGain = computeNormalizationGainMb(targetMediaId)
+
+            if (!isStillRelevant()) return@launch // superseded while we were computing gain
+
+            try {
+                val enhancer = LoudnessEnhancer(audioSessionId).apply {
+                    if (clampedGain != null) {
+                        setTargetGain(clampedGain)
+                        enabled = true
+                        Timber.tag(TAG).i("Secondary LoudnessEnhancer gain applied: $clampedGain mB (session=$audioSessionId)")
+                    } else {
+                        enabled = false
+                    }
+                }
+                if (player === secPlayer) {
+                    // The swap already happened: secPlayer is now the primary
+                    // player, so attach directly as the primary enhancer
+                    // instead of secondaryLoudnessEnhancer, which
+                    // performCrossfadeSwap() has no further reason to revisit.
+                    loudnessEnhancer?.release()
+                    loudnessEnhancer = enhancer
+                } else {
+                    // Still waiting to be swapped in; performCrossfadeSwap()
+                    // will promote this to `loudnessEnhancer` when it runs.
+                    secondaryLoudnessEnhancer?.release()
+                    secondaryLoudnessEnhancer = enhancer
+                }
+            } catch (e: Exception) {
+                Timber.tag(TAG).e(e, "Failed to set up secondary LoudnessEnhancer")
+                reportException(e)
             }
         }
     }
@@ -3769,6 +3896,13 @@ class MusicService :
             }
         }
         secondaryPlayer = null
+        try {
+            secondaryLoudnessEnhancer?.release()
+        } catch (e: Exception) {
+            Timber.tag(TAG).e(e, "%s: error releasing secondary LoudnessEnhancer", caller)
+        } finally {
+            secondaryLoudnessEnhancer = null
+        }
         isCrossfading = false
     }
 
@@ -3818,6 +3952,9 @@ class MusicService :
             val secPlayer = secondaryPlayer!!
             secPlayer.addListener(secondaryPlayerListener)
             secPlayer.volume = 0f
+            // Copy playback speed/pitch so the incoming track doesn't jump to
+            // 1.0x mid-fade if the user has a custom speed set.
+            secPlayer.playbackParameters = player.playbackParameters
 
             val shuffleSetup = configure(secPlayer)
             shuffleEnabled = shuffleSetup.enabled
@@ -3833,6 +3970,11 @@ class MusicService :
 
             secPlayer.prepare()
             secPlayer.playWhenReady = true
+
+            // configure() has already loaded secPlayer's target item(s) and
+            // seeked/positioned it, so currentMediaItem now reflects the
+            // track this crossfade is actually fading into.
+            setupSecondaryLoudnessEnhancer(secPlayer, secPlayer.currentMediaItem?.mediaId)
         } catch (e: Exception) {
             Timber.tag(TAG).e(e, "%s: failed to set up secondary player", caller)
             releaseCrossfadeReservation(caller)
@@ -4119,6 +4261,15 @@ class MusicService :
         val currentPlayer = player
 
         fadingPlayer = currentPlayer
+
+        // The outgoing player keeps whatever LoudnessEnhancer was bound to its
+        // session, so it stays correctly gained for the remainder of the fade;
+        // whatever setupSecondaryLoudnessEnhancer() prepared for the incoming
+        // player (if it finished in time) becomes the new primary enhancer.
+        fadingLoudnessEnhancer = loudnessEnhancer
+        loudnessEnhancer = secondaryLoudnessEnhancer
+        secondaryLoudnessEnhancer = null
+
         player = nextPlayer
         _playerFlow.value = player
         secondaryPlayer = null
@@ -4157,7 +4308,14 @@ class MusicService :
             val duration = crossfadeDuration.toLong()
             val steps = 20
             val stepTime = duration / steps
-            val startVolume = try { fadingPlayer?.volume ?: 1f } catch(e:Exception) { 1f }
+            // Seed the live base volume from the outgoing player's current
+            // volume (it was `player` a moment ago, so it already reflects
+            // the user's slider/mute/ducking state). From here on, mute,
+            // ducking, and slider changes update crossfadeBaseVolume directly
+            // via applyBaseVolume() instead of writing player.volume, so this
+            // loop always fades around the live value instead of a stale
+            // snapshot taken once at swap time.
+            crossfadeBaseVolume = try { fadingPlayer?.volume ?: 1f } catch (e: Exception) { 1f }
 
             for (i in 0..steps) {
                 if (!isActive) break
@@ -4183,7 +4341,7 @@ class MusicService :
                             "crossfadeJob: new player reached %s while waiting to fade in, finishing crossfade immediately",
                             if (player.playbackState == Player.STATE_IDLE) "STATE_IDLE" else "STATE_ENDED",
                         )
-                        finishCrossfadeImmediately(startVolume)
+                        finishCrossfadeImmediately()
                         return@launch
                     }
                     if (player.playWhenReady) {
@@ -4193,7 +4351,7 @@ class MusicService :
                                 "crossfadeJob: timed out after %dms waiting for new player to start playing, finishing crossfade immediately",
                                 CROSSFADE_BUFFERING_TIMEOUT_MS,
                             )
-                            finishCrossfadeImmediately(startVolume)
+                            finishCrossfadeImmediately()
                             return@launch
                         }
                     } else {
@@ -4209,8 +4367,8 @@ class MusicService :
                 val fadeOut = crossfadeCurve.fadeOut(progress)
 
                 try {
-                    player.volume = startVolume * fadeIn
-                    fadingPlayer?.volume = startVolume * fadeOut
+                    player.volume = crossfadeBaseVolume * fadeIn
+                    fadingPlayer?.volume = crossfadeBaseVolume * fadeOut
                 } catch (e: Exception) { break }
 
                 delay(stepTime)
@@ -4218,7 +4376,7 @@ class MusicService :
 
             try {
                 fadingPlayer?.volume = 0f
-                player.volume = startVolume
+                player.volume = crossfadeBaseVolume
                 cleanupCrossfade()
             } catch (e: Exception) { }
         }
@@ -4233,10 +4391,10 @@ class MusicService :
      * silent or the old one lingering, then tears down exactly like a normal
      * fade completion so [isCrossfading] always gets reset.
      */
-    private fun finishCrossfadeImmediately(startVolume: Float) {
+    private fun finishCrossfadeImmediately() {
         try {
             fadingPlayer?.volume = 0f
-            player.volume = startVolume
+            player.volume = crossfadeBaseVolume
         } catch (e: Exception) { }
         cleanupCrossfade()
     }
@@ -4246,6 +4404,13 @@ class MusicService :
         fadingPlayer?.clearMediaItems()
         fadingPlayer?.release()
         fadingPlayer = null
+        try {
+            fadingLoudnessEnhancer?.release()
+        } catch (e: Exception) {
+            Timber.tag(TAG).e(e, "Error releasing fading LoudnessEnhancer: ${e.message}")
+        } finally {
+            fadingLoudnessEnhancer = null
+        }
         isCrossfading = false
         sleepTimer.notifySongTransition()
     }
