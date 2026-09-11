@@ -52,6 +52,7 @@ import com.music.vivi.constants.CanvasThumbnailAnimationKey
 import com.music.vivi.constants.CanvasSourceKey
 import com.music.vivi.constants.CanvasSource
 import com.music.vivi.constants.CrossfadeDurationKey
+import com.music.vivi.constants.CrossfadeManualSkipDurationKey
 import com.music.vivi.constants.CrossfadeEnabledKey
 import com.music.vivi.constants.CrossfadeGaplessKey
 import com.music.vivi.constants.CrossfadeManualSkipKey
@@ -115,6 +116,13 @@ fun PlayerSettings(
     val (crossfadeManualSkip, onCrossfadeManualSkipChange) = rememberPreference(
         CrossfadeManualSkipKey,
         defaultValue = false
+    )
+    // Falls back to the main crossfade duration's current value if this has
+    // never been explicitly set, matching the backend's own fallback in
+    // MusicService.kt (CrossfadeSettings.manualSkipDurationSeconds).
+    val (crossfadeManualSkipDuration, onCrossfadeManualSkipDurationChange) = rememberPreference(
+        CrossfadeManualSkipDurationKey,
+        defaultValue = crossfadeDuration
     )
     val (persistentQueue, onPersistentQueueChange) = rememberPreference(
         PersistentQueueKey,
@@ -488,6 +496,23 @@ fun PlayerSettings(
                         },
                         onClick = { onCrossfadeManualSkipChange(!crossfadeManualSkip) }
                     ))
+                    if (crossfadeManualSkip) {
+                        add(Material3SettingsItem(
+                            icon = painterResource(R.drawable.timer),
+                            title = { Text(stringResource(R.string.crossfade_manual_skip_duration)) },
+                            description = {
+                                Column {
+                                    Text(pluralStringResource(R.plurals.seconds, crossfadeManualSkipDuration.toInt(), crossfadeManualSkipDuration.toInt()))
+                                    Slider(
+                                        value = crossfadeManualSkipDuration,
+                                        onValueChange = onCrossfadeManualSkipDurationChange,
+                                        valueRange = 1f..15f,
+                                        steps = 14
+                                    )
+                                }
+                            }
+                        ))
+                    }
                 }
                 add(Material3SettingsItem(
                     icon = painterResource(R.drawable.history),

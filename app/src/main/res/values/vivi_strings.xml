@@ -340,6 +340,7 @@
     <string name="crossfade_gapless_desc">Don\'t crossfade if the album is gapless</string>
     <string name="crossfade_manual_skip">Crossfade on manual skip</string>
     <string name="crossfade_manual_skip_desc">Also crossfade when you press next/previous, instead of only at the end of a track</string>
+    <string name="crossfade_manual_skip_duration">Manual skip crossfade duration</string>
     <string name="crossfade_curve">Crossfade curve</string>
     <string name="crossfade_curve_desc">Shape of the volume ramp between tracks</string>
     <string name="crossfade_curve_entry_equal_power">Equal power</string>

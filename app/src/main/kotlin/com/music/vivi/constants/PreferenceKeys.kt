@@ -200,6 +200,12 @@ val ShufflePlaylistFirstKey = booleanPreferencesKey("shufflePlaylistFirst")
 val PreventDuplicateTracksInQueueKey = booleanPreferencesKey("preventDuplicateTracksInQueue")
 val CrossfadeEnabledKey = booleanPreferencesKey("crossfadeEnabled")
 val CrossfadeDurationKey = floatPreferencesKey("crossfadeDuration")
+// Separate, optional duration for manually-triggered crossfades (next/previous
+// skip, tapping a track in the queue, jumping to a different playlist/queue) —
+// distinct from the natural end-of-track crossfade duration above. Falls back
+// to CrossfadeDurationKey when unset, so behavior is unchanged until this is
+// explicitly configured.
+val CrossfadeManualSkipDurationKey = floatPreferencesKey("crossfadeManualSkipDuration")
 val CrossfadeGaplessKey = booleanPreferencesKey("crossfadeGapless")
 val CrossfadeManualSkipKey = booleanPreferencesKey("crossfadeManualSkip")
 val CrossfadeCurveKey = stringPreferencesKey("crossfadeCurve")

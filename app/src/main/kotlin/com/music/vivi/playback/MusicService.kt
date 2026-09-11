@@ -89,6 +89,7 @@ import com.music.vivi.constants.AutoSkipNextOnErrorKey
 import com.music.vivi.constants.CrossfadeCurve
 import com.music.vivi.constants.CrossfadeCurveKey
 import com.music.vivi.constants.CrossfadeDurationKey
+import com.music.vivi.constants.CrossfadeManualSkipDurationKey
 import com.music.vivi.constants.CrossfadeEnabledKey
 import com.music.vivi.constants.CrossfadeGaplessKey
 import com.music.vivi.constants.CrossfadeManualSkipKey
@@ -276,6 +277,12 @@ class MusicService :
 
     private var crossfadeEnabled = false
     private var crossfadeDuration = 5000f
+    // Duration used for manually-triggered crossfades (skip next/previous, tap
+    // a track in the queue, jump to a different queue/playlist) as opposed to
+    // the natural end-of-track crossfade above. Tracks crossfadeDuration until
+    // the user configures CrossfadeManualSkipDurationKey separately — see
+    // CrossfadeSettings.manualSkipDurationSeconds.
+    private var manualCrossfadeDuration = 5000f
     private var crossfadeGapless = true
     private var crossfadeManualSkipEnabled = false
     private var crossfadeCurve = CrossfadeCurve.EASE_OUT_QUAD
@@ -285,6 +292,7 @@ class MusicService :
     private data class CrossfadeSettings(
         val enabled: Boolean,
         val durationSeconds: Float,
+        val manualSkipDurationSeconds: Float,
         val gapless: Boolean,
         val manualSkip: Boolean,
         val curve: CrossfadeCurve,
@@ -1026,9 +1034,22 @@ class MusicService :
 
         combine(
             dataStore.data.map { prefs ->
+                // Clamp to the same range the settings-screen slider enforces
+                // (1..15s). DataStore values aren't otherwise validated before
+                // reaching the crossfade code, so without this a stray or
+                // corrupted value (0, negative, or absurdly large) could reach
+                // the fade loop directly — this key currently has no slider of
+                // its own at all, so it especially needs its own floor/ceiling
+                // rather than trusting whatever is stored.
+                val durationSeconds = (prefs[CrossfadeDurationKey] ?: 5f)
+                    .coerceIn(MIN_CROSSFADE_DURATION_SECONDS, MAX_CROSSFADE_DURATION_SECONDS)
+                val manualSkipDurationSeconds = prefs[CrossfadeManualSkipDurationKey]
+                    ?.coerceIn(MIN_CROSSFADE_DURATION_SECONDS, MAX_CROSSFADE_DURATION_SECONDS)
+                    ?: durationSeconds
                 CrossfadeSettings(
                     enabled = prefs[CrossfadeEnabledKey] ?: false,
-                    durationSeconds = prefs[CrossfadeDurationKey] ?: 5f,
+                    durationSeconds = durationSeconds,
+                    manualSkipDurationSeconds = manualSkipDurationSeconds,
                     gapless = prefs[CrossfadeGaplessKey] ?: true,
                     manualSkip = prefs[CrossfadeManualSkipKey] ?: false,
                     curve = prefs[CrossfadeCurveKey].toEnum(CrossfadeCurve.EASE_OUT_QUAD),
@@ -1043,6 +1064,7 @@ class MusicService :
             .collect(scope) { settings ->
                 crossfadeEnabled = settings.enabled
                 crossfadeDuration = settings.durationSeconds * 1000f // Convert to ms
+                manualCrossfadeDuration = settings.manualSkipDurationSeconds * 1000f
                 crossfadeGapless = settings.gapless
                 crossfadeManualSkipEnabled = settings.manualSkip
                 crossfadeCurve = settings.curve
@@ -3942,20 +3964,24 @@ class MusicService :
      * sequence; they now differ only in *which* media items go on the
      * secondary player, supplied via [configure].
      *
-     * [caller] identifies the entry point in logs. [configure] receives the
-     * freshly created secondary player, is responsible for loading its media
-     * item(s) (`setMediaItem`/`setMediaItems` + any seek) and setting
-     * `repeatMode` / `shuffleModeEnabled` on it, and returns a [ShuffleSetup]
-     * describing what to do about shuffle order afterward. Any exception
-     * thrown during setup (by [configure] or by this function) is caught,
-     * logged, and turned into a released reservation instead of a half-built
-     * secondary player.
+     * [caller] identifies the entry point in logs. [durationMs] is the fade
+     * length to use for this specific crossfade — callers pass the AUTO
+     * end-of-track duration or the (possibly different) manual-skip duration
+     * depending on why this crossfade is starting; see [performCrossfadeSwap].
+     * [configure] receives the freshly created secondary player, is
+     * responsible for loading its media item(s) (`setMediaItem`/`setMediaItems`
+     * + any seek) and setting `repeatMode` / `shuffleModeEnabled` on it, and
+     * returns a [ShuffleSetup] describing what to do about shuffle order
+     * afterward. Any exception thrown during setup (by [configure] or by this
+     * function) is caught, logged, and turned into a released reservation
+     * instead of a half-built secondary player.
      *
      * Returns `true` only if the secondary player was actually swapped in as
      * the new primary player.
      */
     private fun beginCrossfadeSwap(
         caller: String,
+        durationMs: Long,
         configure: (ExoPlayer) -> ShuffleSetup,
     ): Boolean {
         if (!reserveCrossfadeSlot(caller)) return false
@@ -3996,8 +4022,8 @@ class MusicService :
             return false
         }
 
-        Timber.tag(TAG).d("%s: secondary player ready, starting swap", caller)
-        if (!performCrossfadeSwap()) return false
+        Timber.tag(TAG).d("%s: secondary player ready, starting swap (durationMs=%d)", caller, durationMs)
+        if (!performCrossfadeSwap(durationMs)) return false
 
         // If shuffle is on but the order wasn't carried over (a genuinely
         // different queue, a same-queue size mismatch, or a preload item with
@@ -4075,7 +4101,19 @@ class MusicService :
         }
         if (targetIndex == C.INDEX_UNSET) return
 
-        beginCrossfadeSwap("startCrossfade") { secPlayer ->
+        // AUTO (natural end-of-track) uses the main crossfade duration; a
+        // manual next/previous skip uses the (possibly shorter) manual-skip
+        // duration instead, so a deliberate skip doesn't have to sit through
+        // as long a blend as an unattended track transition. Written as an
+        // exhaustive `when` (no `else`) rather than `if (trigger == AUTO) ...
+        // else ...` on purpose: if a new CrossfadeTrigger value is ever added,
+        // this fails to compile instead of silently treating it as manual.
+        val durationMs = when (trigger) {
+            CrossfadeTrigger.AUTO -> crossfadeDuration.toLong()
+            CrossfadeTrigger.MANUAL_NEXT, CrossfadeTrigger.MANUAL_PREVIOUS -> manualCrossfadeDuration.toLong()
+        }
+
+        beginCrossfadeSwap("startCrossfade", durationMs) { secPlayer ->
             setupSecondaryFromPrimaryQueue(secPlayer, targetIndex, savedRepeatMode, savedShuffleEnabled)
         }
     }
@@ -4171,7 +4209,7 @@ class MusicService :
         val savedRepeatMode = runBlocking { dataStore.get(RepeatModeKey, REPEAT_MODE_OFF) }
         val savedShuffleEnabled = runBlocking { dataStore.get(ShuffleModeKey, false) }
 
-        beginCrossfadeSwap("startCrossfadeToIndex") { secPlayer ->
+        beginCrossfadeSwap("startCrossfadeToIndex", manualCrossfadeDuration.toLong()) { secPlayer ->
             setupSecondaryFromPrimaryQueue(secPlayer, targetIndex, savedRepeatMode, savedShuffleEnabled)
         }
     }
@@ -4210,7 +4248,7 @@ class MusicService :
         val preservedShuffleOrder =
             if (carryingShuffle && sameQueue) getCurrentShuffleOrderIndices(player) else null
 
-        return beginCrossfadeSwap("startQueueCrossfade") { secPlayer ->
+        return beginCrossfadeSwap("startQueueCrossfade", manualCrossfadeDuration.toLong()) { secPlayer ->
             secPlayer.setMediaItems(status.items, targetIndex, status.position)
             secPlayer.repeatMode = savedRepeatMode
             secPlayer.shuffleModeEnabled = carryingShuffle
@@ -4246,7 +4284,7 @@ class MusicService :
 
         val savedRepeatMode = runBlocking { dataStore.get(RepeatModeKey, REPEAT_MODE_OFF) }
 
-        return beginCrossfadeSwap("startQueueCrossfadeWithPreload") { secPlayer ->
+        return beginCrossfadeSwap("startQueueCrossfadeWithPreload", manualCrossfadeDuration.toLong()) { secPlayer ->
             secPlayer.setMediaItem(preloadItem.toMediaItem())
             secPlayer.repeatMode = savedRepeatMode
             val shuffleEnabled = persistShuffleAcrossQueues && player.shuffleModeEnabled
@@ -4258,7 +4296,7 @@ class MusicService :
         }
     }
 
-    private fun performCrossfadeSwap(): Boolean {
+    private fun performCrossfadeSwap(durationMs: Long): Boolean {
         // isCrossfading is already true from reserveCrossfadeSlot(). This null
         // check is now a defensive safety net rather than the primary guard:
         // previously this function set isCrossfading = true unconditionally
@@ -4320,7 +4358,7 @@ class MusicService :
         }
 
         crossfadeJob = scope.launch {
-            val duration = crossfadeDuration.toLong()
+            val duration = durationMs
             val steps = 20
             val stepTime = duration / steps
             // Seed the live base volume from the outgoing player's current
@@ -4455,6 +4493,12 @@ class MusicService :
         // spinning forever. See the comment in performCrossfadeSwap's
         // crossfadeJob for why this matters.
         private const val CROSSFADE_BUFFERING_TIMEOUT_MS = 15_000L
+        // Valid range for both crossfade duration settings (main and
+        // manual-skip), matching the range the settings-screen slider
+        // enforces for the main one. See the coerceIn() call where
+        // CrossfadeSettings is built from DataStore.
+        private const val MIN_CROSSFADE_DURATION_SECONDS = 1f
+        private const val MAX_CROSSFADE_DURATION_SECONDS = 15f
         // Constants for audio normalization
         private const val MAX_GAIN_MB = 300 // Maximum gain in millibels (3 dB)
         private const val MIN_GAIN_MB = -1500 // Minimum gain in millibels (-15 dB)
