@@ -12,10 +12,22 @@ import org.junit.Test
  * must produce the exact same [TransitionPlan] the inline code built before
  * this class existed (see [TransitionPlanFactoryTest] for the equivalent
  * manual-path coverage). No audio analysis, no randomness, no hidden state.
+ *
+ * The `context: TransitionContext`-specific tests near the bottom exist to
+ * prove the data path from MusicService to this class is real (see
+ * MusicService.startCrossfade's AUTO branch) without yet influencing any
+ * decision — see TransitionContext's own doc comment for why it's nullable.
  */
 class SmartCrossfadeEngineTest {
 
     private val engine = SmartCrossfadeEngine()
+
+    // An arbitrary non-empty context, used by tests that don't care what's
+    // in it, to make clear the assertions below hold regardless of content.
+    private val sampleContext = TransitionContext(
+        outgoingDurationMs = 210_000L,
+        incomingDurationMs = 195_000L,
+    )
 
     @Test
     fun `uses the given auto duration`() {
@@ -23,6 +35,7 @@ class SmartCrossfadeEngineTest {
             autoDurationMs = 5_000L,
             curve = CrossfadeCurve.EASE_OUT_QUAD,
             outgoingPositionMs = 0L,
+            context = sampleContext,
         )
 
         assertEquals(5_000L, plan.durationMs)
@@ -37,6 +50,7 @@ class SmartCrossfadeEngineTest {
             autoDurationMs = 5_000L,
             curve = CrossfadeCurve.EASE_OUT_QUAD,
             outgoingPositionMs = 187_000L,
+            context = sampleContext,
         )
 
         assertEquals(0L, plan.incomingPositionMs)
@@ -48,6 +62,7 @@ class SmartCrossfadeEngineTest {
             autoDurationMs = 5_000L,
             curve = CrossfadeCurve.EASE_OUT_QUAD,
             outgoingPositionMs = 187_000L,
+            context = sampleContext,
         )
 
         assertEquals(187_000L, plan.outgoingPositionMs)
@@ -59,6 +74,7 @@ class SmartCrossfadeEngineTest {
             autoDurationMs = 5_000L,
             curve = CrossfadeCurve.SMOOTHSTEP,
             outgoingPositionMs = 0L,
+            context = sampleContext,
         )
 
         assertEquals(CrossfadeCurve.SMOOTHSTEP, plan.curve)
@@ -70,11 +86,13 @@ class SmartCrossfadeEngineTest {
             autoDurationMs = 8_400L,
             curve = CrossfadeCurve.EQUAL_POWER,
             outgoingPositionMs = 42_000L,
+            context = sampleContext,
         )
         val b = engine.createTransition(
             autoDurationMs = 8_400L,
             curve = CrossfadeCurve.EQUAL_POWER,
             outgoingPositionMs = 42_000L,
+            context = sampleContext,
         )
 
         assertEquals(a, b)
@@ -95,6 +113,7 @@ class SmartCrossfadeEngineTest {
             autoDurationMs = autoDurationMs,
             curve = curve,
             outgoingPositionMs = outgoingPositionMs,
+            context = sampleContext,
         )
         val fromFactory = TransitionPlanFactory.forCurrentSettings(
             isManualTransition = false,
@@ -105,5 +124,76 @@ class SmartCrossfadeEngineTest {
         )
 
         assertEquals(fromFactory, fromEngine)
+    }
+
+    // --- TransitionContext wiring: proves the parameter is connected but inert ---
+
+    @Test
+    fun `an empty TransitionContext produces the same plan as before this parameter existed`() {
+        val plan = engine.createTransition(
+            autoDurationMs = 5_000L,
+            curve = CrossfadeCurve.EASE_OUT_QUAD,
+            outgoingPositionMs = 42_000L,
+            context = TransitionContext(),
+        )
+
+        val expected = TransitionPlan(
+            durationMs = 5_000L,
+            outgoingPositionMs = 42_000L,
+            incomingPositionMs = 0L,
+            curve = CrossfadeCurve.EASE_OUT_QUAD,
+        )
+        assertEquals(expected, plan)
+    }
+
+    @Test
+    fun `a TransitionContext with real durations produces exactly the same plan`() {
+        // Same autoDurationMs/curve/outgoingPositionMs as the previous test,
+        // only the context differs (empty vs. real-looking durations) — the
+        // resulting plan must be identical either way.
+        val plan = engine.createTransition(
+            autoDurationMs = 5_000L,
+            curve = CrossfadeCurve.EASE_OUT_QUAD,
+            outgoingPositionMs = 42_000L,
+            context = TransitionContext(
+                outgoingDurationMs = 210_000L,
+                incomingDurationMs = 195_000L,
+            ),
+        )
+
+        val expected = TransitionPlan(
+            durationMs = 5_000L,
+            outgoingPositionMs = 42_000L,
+            incomingPositionMs = 0L,
+            curve = CrossfadeCurve.EASE_OUT_QUAD,
+        )
+        assertEquals(expected, plan)
+    }
+
+    @Test
+    fun `context is connected but does not affect the decision - varying it alone changes nothing`() {
+        // Holds every other input fixed and only varies the context, across
+        // several shapes (empty, only-outgoing-known, only-incoming-known,
+        // both known, both wildly different from the other cases) — the plan
+        // must come out equal every time. This is the explicit "wired but
+        // inert" guarantee for this stage of the architecture.
+        val contexts = listOf(
+            TransitionContext(),
+            TransitionContext(outgoingDurationMs = 210_000L),
+            TransitionContext(incomingDurationMs = 195_000L),
+            TransitionContext(outgoingDurationMs = 210_000L, incomingDurationMs = 195_000L),
+            TransitionContext(outgoingDurationMs = 1L, incomingDurationMs = 999_999L),
+        )
+
+        val plans = contexts.map { context ->
+            engine.createTransition(
+                autoDurationMs = 7_200L,
+                curve = CrossfadeCurve.SMOOTHSTEP,
+                outgoingPositionMs = 15_000L,
+                context = context,
+            )
+        }
+
+        plans.forEach { plan -> assertEquals(plans.first(), plan) }
     }
 }

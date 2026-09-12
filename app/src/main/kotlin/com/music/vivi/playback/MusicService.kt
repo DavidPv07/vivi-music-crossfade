@@ -4123,11 +4123,26 @@ class MusicService :
         // on purpose: if a new CrossfadeTrigger value is ever added, this
         // fails to compile instead of silently routing it through either path.
         val plan = when (trigger) {
-            CrossfadeTrigger.AUTO -> smartCrossfadeEngine.createTransition(
-                autoDurationMs = crossfadeDuration.toLong(),
-                curve = crossfadeCurve,
-                outgoingPositionMs = player.currentPosition,
-            )
+            CrossfadeTrigger.AUTO -> {
+                // Outgoing: ExoPlayer's own measured duration of the track
+                // currently playing — null if not yet resolved. Incoming:
+                // catalog-provided duration attached to the target MediaItem
+                // at construction time (Song/SongItem/MediaMetadata.toMediaItem()),
+                // available whether or not that item has been buffered yet —
+                // see TransitionContext's doc comment for why this is used
+                // instead of the target's own (often-unset) Timeline.Window
+                // duration.
+                val transitionContext = TransitionContext(
+                    outgoingDurationMs = player.duration.takeIf { it != C.TIME_UNSET },
+                    incomingDurationMs = player.getMediaItemAt(targetIndex).metadata?.duration?.let { it * 1000L },
+                )
+                smartCrossfadeEngine.createTransition(
+                    autoDurationMs = crossfadeDuration.toLong(),
+                    curve = crossfadeCurve,
+                    outgoingPositionMs = player.currentPosition,
+                    context = transitionContext,
+                )
+            }
             CrossfadeTrigger.MANUAL_NEXT, CrossfadeTrigger.MANUAL_PREVIOUS -> TransitionPlanFactory.forCurrentSettings(
                 isManualTransition = true,
                 autoDurationMs = crossfadeDuration.toLong(),

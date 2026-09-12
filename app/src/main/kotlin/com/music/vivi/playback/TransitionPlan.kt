@@ -96,6 +96,31 @@ internal object TransitionPlanFactory {
 }
 
 /**
+ * Minimal, reliably-available information about the two tracks involved in
+ * a transition, passed to a decision-maker like [SmartCrossfadeEngine].
+ *
+ * Deliberately just durations for now — no tempo, energy, silence, or any
+ * other analysis. Both fields are nullable because neither source is
+ * guaranteed:
+ * - [outgoingDurationMs] comes from the primary player's own measured
+ *   duration of the currently-playing track (`player.duration`) — null if
+ *   ExoPlayer hasn't resolved a duration yet (`C.TIME_UNSET`).
+ * - [incomingDurationMs] comes from the catalog metadata already attached to
+ *   the target `MediaItem` (see `com.music.vivi.extensions.metadata`), not
+ *   from ExoPlayer — the incoming track is often not buffered yet, so its
+ *   own `Timeline.Window` duration would frequently be unset. Catalog data
+ *   is accurate in practice, but this file can't guarantee every MediaItem
+ *   construction path in the app attaches it.
+ *
+ * Add fields here only when a real decision needs to consume them — see
+ * [TransitionPlan]'s own doc comment for the same rule.
+ */
+data class TransitionContext(
+    val outgoingDurationMs: Long? = null,
+    val incomingDurationMs: Long? = null,
+)
+
+/**
  * Decides the [TransitionPlan] for an automatic (unattended, end-of-track)
  * crossfade. This is the "decision-maker" seam the architecture is built
  * around: [MusicService] calls this instead of building the plan inline, so
@@ -117,6 +142,12 @@ internal object TransitionPlanFactory {
  * other "smart" behavior lives here yet — that's future work, done inside
  * this same method once there's something real to base a decision on.
  *
+ * [context] is accepted (and required — every real caller must resolve one)
+ * so the data path from MusicService all the way to this decision point
+ * exists and is exercised, but its contents are deliberately not read yet.
+ * That's the point of this stage: wire the pipe before anything flows
+ * through it that changes behavior.
+ *
  * Like [TransitionPlanFactory], this NEVER touches ExoPlayer, DataStore, or
  * playback state directly: every input it needs is passed in by the caller,
  * and its only output is a [TransitionPlan].
@@ -135,11 +166,15 @@ class SmartCrossfadeEngine {
      *   caller.
      * @param outgoingPositionMs where the outgoing track is positioned right
      *   now; see [TransitionPlan.outgoingPositionMs] — informational only.
+     * @param context reliably-available info about both tracks (currently
+     *   just their durations) — read by nothing in this method yet; see the
+     *   class doc comment.
      */
     fun createTransition(
         autoDurationMs: Long,
         curve: CrossfadeCurve,
         outgoingPositionMs: Long,
+        context: TransitionContext,
     ): TransitionPlan = TransitionPlan(
         durationMs = autoDurationMs,
         outgoingPositionMs = outgoingPositionMs,
