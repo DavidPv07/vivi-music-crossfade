@@ -4114,15 +4114,16 @@ class MusicService :
         // exhaustive `when` (no `else`) rather than `if (trigger == AUTO) ...
         // else ...` on purpose: if a new CrossfadeTrigger value is ever added,
         // this fails to compile instead of silently treating it as manual.
-        val durationMs = when (trigger) {
-            CrossfadeTrigger.AUTO -> crossfadeDuration.toLong()
-            CrossfadeTrigger.MANUAL_NEXT, CrossfadeTrigger.MANUAL_PREVIOUS -> manualCrossfadeDuration.toLong()
+        val isManualTransition = when (trigger) {
+            CrossfadeTrigger.AUTO -> false
+            CrossfadeTrigger.MANUAL_NEXT, CrossfadeTrigger.MANUAL_PREVIOUS -> true
         }
-        val plan = TransitionPlan(
-            durationMs = durationMs,
-            outgoingPositionMs = player.currentPosition,
-            incomingPositionMs = 0L,
+        val plan = TransitionPlanFactory.forCurrentSettings(
+            isManualTransition = isManualTransition,
+            autoDurationMs = crossfadeDuration.toLong(),
+            manualDurationMs = manualCrossfadeDuration.toLong(),
             curve = crossfadeCurve,
+            outgoingPositionMs = player.currentPosition,
         )
 
         beginCrossfadeSwap("startCrossfade", plan) { secPlayer ->
@@ -4221,11 +4222,12 @@ class MusicService :
         val savedRepeatMode = runBlocking { dataStore.get(RepeatModeKey, REPEAT_MODE_OFF) }
         val savedShuffleEnabled = runBlocking { dataStore.get(ShuffleModeKey, false) }
 
-        val plan = TransitionPlan(
-            durationMs = manualCrossfadeDuration.toLong(),
-            outgoingPositionMs = player.currentPosition,
-            incomingPositionMs = 0L,
+        val plan = TransitionPlanFactory.forCurrentSettings(
+            isManualTransition = true,
+            autoDurationMs = crossfadeDuration.toLong(),
+            manualDurationMs = manualCrossfadeDuration.toLong(),
             curve = crossfadeCurve,
+            outgoingPositionMs = player.currentPosition,
         )
 
         beginCrossfadeSwap("startCrossfadeToIndex", plan) { secPlayer ->
@@ -4267,15 +4269,17 @@ class MusicService :
         val preservedShuffleOrder =
             if (carryingShuffle && sameQueue) getCurrentShuffleOrderIndices(player) else null
 
-        val plan = TransitionPlan(
-            durationMs = manualCrossfadeDuration.toLong(),
+        val plan = TransitionPlanFactory.forCurrentSettings(
+            isManualTransition = true,
+            autoDurationMs = crossfadeDuration.toLong(),
+            manualDurationMs = manualCrossfadeDuration.toLong(),
+            curve = crossfadeCurve,
             outgoingPositionMs = player.currentPosition,
             // Not 0 like the other manual entry points: this resumes a
             // synced/saved queue position (e.g. Listen Together), so the
             // incoming player needs to start from wherever that queue said
             // to, not from the beginning of the track.
             incomingPositionMs = status.position,
-            curve = crossfadeCurve,
         )
 
         return beginCrossfadeSwap("startQueueCrossfade", plan) { secPlayer ->
@@ -4314,11 +4318,12 @@ class MusicService :
 
         val savedRepeatMode = runBlocking { dataStore.get(RepeatModeKey, REPEAT_MODE_OFF) }
 
-        val plan = TransitionPlan(
-            durationMs = manualCrossfadeDuration.toLong(),
-            outgoingPositionMs = player.currentPosition,
-            incomingPositionMs = 0L,
+        val plan = TransitionPlanFactory.forCurrentSettings(
+            isManualTransition = true,
+            autoDurationMs = crossfadeDuration.toLong(),
+            manualDurationMs = manualCrossfadeDuration.toLong(),
             curve = crossfadeCurve,
+            outgoingPositionMs = player.currentPosition,
         )
 
         return beginCrossfadeSwap("startQueueCrossfadeWithPreload", plan) { secPlayer ->

@@ -48,3 +48,40 @@ data class TransitionPlan(
     /** Volume ramp shape to use for this specific transition. */
     val curve: CrossfadeCurve,
 )
+
+/**
+ * Builds the transition plan for every crossfade entry point *before*
+ * AutoMix exists — pick the AUTO or manual-skip duration, use the user's
+ * configured curve, and record where the outgoing track currently sits.
+ *
+ * This is intentionally the exact same decision every call site made inline
+ * before this was extracted (see MusicService.startCrossfade and friends):
+ * a plain function of already-resolved values, with no Player, DataStore, or
+ * MusicService reference — so it's unit-testable on its own, and so that
+ * swapping in an AutoMix-provided plan later only means changing what calls
+ * this (or replacing the call with AutoMix's own decision), never touching
+ * the crossfade engine that executes whatever plan it's handed.
+ */
+internal object TransitionPlanFactory {
+    /**
+     * @param isManualTransition true for a user-initiated skip/tap (next,
+     *   previous, queue selection, playlist tap) as opposed to an unattended
+     *   end-of-track AUTO crossfade — see [MusicService.CrossfadeTrigger].
+     * @param incomingPositionMs defaults to 0 (start of the incoming track).
+     *   `startQueueCrossfade` is the one caller that passes something else: a
+     *   real resume position from a synced/saved queue, unrelated to AutoMix.
+     */
+    fun forCurrentSettings(
+        isManualTransition: Boolean,
+        autoDurationMs: Long,
+        manualDurationMs: Long,
+        curve: CrossfadeCurve,
+        outgoingPositionMs: Long,
+        incomingPositionMs: Long = 0L,
+    ): TransitionPlan = TransitionPlan(
+        durationMs = if (isManualTransition) manualDurationMs else autoDurationMs,
+        outgoingPositionMs = outgoingPositionMs,
+        incomingPositionMs = incomingPositionMs,
+        curve = curve,
+    )
+}
