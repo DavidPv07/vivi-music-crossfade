@@ -8,11 +8,18 @@ import com.music.vivi.constants.CrossfadeCurve
  *
  * This is the boundary between transition *decision* and transition
  * *execution*. Whatever decides that a transition should happen — today, the
- * user's crossfade settings (see [MusicService.startCrossfade] and friends);
- * later, an AutoMix engine — builds a [TransitionPlan]. The crossfade engine
- * ([MusicService.beginCrossfadeSwap] / [MusicService.performCrossfadeSwap])
- * only ever reads one; it never reaches back into settings, DataStore, or
- * track-analysis state to re-derive timing on its own.
+ * user's crossfade settings (see [MusicService.startCrossfade] and friends)
+ * or [SmartCrossfadeEngine]; later, real audio-analysis-driven logic — builds
+ * a [TransitionPlan]. The crossfade engine ([MusicService.beginCrossfadeSwap]
+ * / [MusicService.performCrossfadeSwap]) only ever reads one; it never
+ * reaches back into settings, DataStore, or track-analysis state to
+ * re-derive timing on its own.
+ *
+ * NOTE ON NAMING: this is unrelated to [MusicService.automixItems] /
+ * [MusicService.getAutomix] — YouTube Music's "Automix" feature that
+ * continues a queue with related songs (song *selection*). This file is
+ * about transition *timing/blending* between two already-chosen songs.
+ * [SmartCrossfadeEngine] is named to avoid that collision on purpose.
  *
  * A decision-maker that produces a [TransitionPlan] must NOT directly
  * manipulate: ExoPlayer instances, player volume, the secondary player's
@@ -41,8 +48,8 @@ data class TransitionPlan(
      * Most current callers pass 0 (start from the beginning); one
      * (`startQueueCrossfade`, resuming a synced/saved queue position) passes
      * a real resume position. The architecture supports any non-negative
-     * value so a future AutoMix can pick a better entry point into the next
-     * track — nothing produces an AutoMix-chosen value yet.
+     * value so a future smarter decision-maker can pick a better entry point
+     * into the next track — nothing produces a non-default value here yet.
      */
     val incomingPositionMs: Long,
     /** Volume ramp shape to use for this specific transition. */
@@ -50,17 +57,18 @@ data class TransitionPlan(
 )
 
 /**
- * Builds the transition plan for every crossfade entry point *before*
- * AutoMix exists — pick the AUTO or manual-skip duration, use the user's
- * configured curve, and record where the outgoing track currently sits.
+ * Builds the transition plan for every *manual* crossfade entry point, and
+ * (indirectly, via [SmartCrossfadeEngine]) the automatic one too — pick the
+ * AUTO or manual-skip duration, use the user's configured curve, and record
+ * where the outgoing track currently sits.
  *
  * This is intentionally the exact same decision every call site made inline
  * before this was extracted (see MusicService.startCrossfade and friends):
  * a plain function of already-resolved values, with no Player, DataStore, or
- * MusicService reference — so it's unit-testable on its own, and so that
- * swapping in an AutoMix-provided plan later only means changing what calls
- * this (or replacing the call with AutoMix's own decision), never touching
- * the crossfade engine that executes whatever plan it's handed.
+ * MusicService reference — so it's unit-testable on its own, and so that a
+ * smarter decision-maker can be swapped in later by changing what calls this
+ * (or replacing the call entirely), never touching the crossfade engine that
+ * executes whatever plan it's handed.
  */
 internal object TransitionPlanFactory {
     /**
@@ -69,7 +77,8 @@ internal object TransitionPlanFactory {
      *   end-of-track AUTO crossfade — see [MusicService.CrossfadeTrigger].
      * @param incomingPositionMs defaults to 0 (start of the incoming track).
      *   `startQueueCrossfade` is the one caller that passes something else: a
-     *   real resume position from a synced/saved queue, unrelated to AutoMix.
+     *   real resume position from a synced/saved queue, unrelated to this
+     *   file's [SmartCrossfadeEngine].
      */
     fun forCurrentSettings(
         isManualTransition: Boolean,
@@ -82,6 +91,59 @@ internal object TransitionPlanFactory {
         durationMs = if (isManualTransition) manualDurationMs else autoDurationMs,
         outgoingPositionMs = outgoingPositionMs,
         incomingPositionMs = incomingPositionMs,
+        curve = curve,
+    )
+}
+
+/**
+ * Decides the [TransitionPlan] for an automatic (unattended, end-of-track)
+ * crossfade. This is the "decision-maker" seam the architecture is built
+ * around: [MusicService] calls this instead of building the plan inline, so
+ * that smarter decisions (energy/silence/tempo-aware timing, eventually) can
+ * live entirely inside this class later without the crossfade engine
+ * changing at all.
+ *
+ * NAMING: deliberately NOT called "AutoMix" — see the note on
+ * [MusicService.automixItems] above. This has nothing to do with queue
+ * continuation; it only decides *when and how* a transition between two
+ * already-chosen tracks happens.
+ *
+ * Deliberately dumb today: [createTransition] reproduces exactly the plan
+ * [MusicService.startCrossfade] built inline for `CrossfadeTrigger.AUTO`
+ * before this class existed — same duration, same curve, incoming position
+ * 0. Plugging this in changes nothing about what actually plays; it only
+ * moves the decision to a class that's small, deterministic, and testable
+ * without a real player or DataStore. No audio analysis, scoring, or any
+ * other "smart" behavior lives here yet — that's future work, done inside
+ * this same method once there's something real to base a decision on.
+ *
+ * Like [TransitionPlanFactory], this NEVER touches ExoPlayer, DataStore, or
+ * playback state directly: every input it needs is passed in by the caller,
+ * and its only output is a [TransitionPlan].
+ *
+ * Manual crossfades (skip next/previous, tapping a queue/playlist entry)
+ * never go through this class — see [MusicService.startCrossfade] and the
+ * other entry points, which keep using [TransitionPlanFactory] directly for
+ * those, unchanged.
+ */
+class SmartCrossfadeEngine {
+    /**
+     * @param autoDurationMs the user's configured AUTO crossfade duration
+     *   (`CrossfadeDurationKey`), resolved by the caller — this class never
+     *   reads DataStore itself.
+     * @param curve the user's configured crossfade curve, resolved by the
+     *   caller.
+     * @param outgoingPositionMs where the outgoing track is positioned right
+     *   now; see [TransitionPlan.outgoingPositionMs] — informational only.
+     */
+    fun createTransition(
+        autoDurationMs: Long,
+        curve: CrossfadeCurve,
+        outgoingPositionMs: Long,
+    ): TransitionPlan = TransitionPlan(
+        durationMs = autoDurationMs,
+        outgoingPositionMs = outgoingPositionMs,
+        incomingPositionMs = 0L,
         curve = curve,
     )
 }

@@ -287,6 +287,12 @@ class MusicService :
     private var crossfadeManualSkipEnabled = false
     private var crossfadeCurve = CrossfadeCurve.EASE_OUT_QUAD
     private var crossfadeTriggerJob: Job? = null
+    // Decides the TransitionPlan for automatic (AUTO trigger) crossfades —
+    // see SmartCrossfadeEngine's doc comment for why it's not called
+    // "AutoMix" (that name is already taken by automixItems/getAutomix()
+    // below, an unrelated queue-continuation feature). Stateless and
+    // dependency-free, so plain construction is enough; no DI needed.
+    private val smartCrossfadeEngine = SmartCrossfadeEngine()
 
     /** Holds the combined crossfade-related settings emitted from DataStore. */
     private data class CrossfadeSettings(
@@ -4107,24 +4113,29 @@ class MusicService :
         }
         if (targetIndex == C.INDEX_UNSET) return
 
-        // AUTO (natural end-of-track) uses the main crossfade duration; a
-        // manual next/previous skip uses the (possibly shorter) manual-skip
-        // duration instead, so a deliberate skip doesn't have to sit through
-        // as long a blend as an unattended track transition. Written as an
-        // exhaustive `when` (no `else`) rather than `if (trigger == AUTO) ...
-        // else ...` on purpose: if a new CrossfadeTrigger value is ever added,
-        // this fails to compile instead of silently treating it as manual.
-        val isManualTransition = when (trigger) {
-            CrossfadeTrigger.AUTO -> false
-            CrossfadeTrigger.MANUAL_NEXT, CrossfadeTrigger.MANUAL_PREVIOUS -> true
+        // AUTO (natural end-of-track) is decided by SmartCrossfadeEngine — see
+        // its doc comment; today it reproduces the same duration/curve/
+        // position-0 plan this branch always built directly, so this changes
+        // nothing about what plays. A manual next/previous skip keeps using
+        // TransitionPlanFactory directly and the (possibly shorter)
+        // manual-skip duration, untouched by this. Written as an exhaustive
+        // `when` (no `else`) rather than `if (trigger == AUTO) ... else ...`
+        // on purpose: if a new CrossfadeTrigger value is ever added, this
+        // fails to compile instead of silently routing it through either path.
+        val plan = when (trigger) {
+            CrossfadeTrigger.AUTO -> smartCrossfadeEngine.createTransition(
+                autoDurationMs = crossfadeDuration.toLong(),
+                curve = crossfadeCurve,
+                outgoingPositionMs = player.currentPosition,
+            )
+            CrossfadeTrigger.MANUAL_NEXT, CrossfadeTrigger.MANUAL_PREVIOUS -> TransitionPlanFactory.forCurrentSettings(
+                isManualTransition = true,
+                autoDurationMs = crossfadeDuration.toLong(),
+                manualDurationMs = manualCrossfadeDuration.toLong(),
+                curve = crossfadeCurve,
+                outgoingPositionMs = player.currentPosition,
+            )
         }
-        val plan = TransitionPlanFactory.forCurrentSettings(
-            isManualTransition = isManualTransition,
-            autoDurationMs = crossfadeDuration.toLong(),
-            manualDurationMs = manualCrossfadeDuration.toLong(),
-            curve = crossfadeCurve,
-            outgoingPositionMs = player.currentPosition,
-        )
 
         beginCrossfadeSwap("startCrossfade", plan) { secPlayer ->
             setupSecondaryFromPrimaryQueue(secPlayer, targetIndex, savedRepeatMode, savedShuffleEnabled, plan.incomingPositionMs)
