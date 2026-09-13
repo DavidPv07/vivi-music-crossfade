@@ -157,10 +157,13 @@ class CrossfadeExecutionRegressionTest {
         }
     }
 
-    // --- 5: no behavior change from wiring TransitionPlan/TransitionContext through ---
+    // --- 5: no unintended behavior change beyond the capping rule itself ---
 
     @Test
-    fun `AUTO plan is unaffected by which TransitionContext accompanies it`() {
+    fun `AUTO plan is unaffected by a TransitionContext whose incoming duration doesn't trigger capping`() {
+        // 195s incoming vs. a 5s crossfade: well above the capping threshold
+        // (see SmartCrossfadeEngineTest's capping-rule tests for the case
+        // where a short incoming duration DOES change durationMs).
         val withRealData = engine.createTransition(
             autoDurationMs = 5_000L,
             curve = curve,

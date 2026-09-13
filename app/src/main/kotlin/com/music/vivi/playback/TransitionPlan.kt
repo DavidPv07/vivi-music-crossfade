@@ -89,11 +89,22 @@ data class TransitionContext(
  * without the crossfade engine changing. See [TransitionPlan]'s doc comment
  * for why this isn't called "AutoMix".
  *
- * Deliberately dumb today: reproduces exactly what `startCrossfade` built
- * inline for `CrossfadeTrigger.AUTO` before this class existed — same
- * duration, curve, and incoming position 0. [context] is required so the
- * data path from MusicService is real and exercised, but nothing here reads
- * it yet.
+ * First real decision: [createTransition] caps the fade duration to the
+ * incoming track's own length when that's known and shorter than the
+ * configured duration — otherwise it reproduces exactly what `startCrossfade`
+ * built inline for `CrossfadeTrigger.AUTO` before this class existed (same
+ * duration, curve, incoming position 0). `scheduleCrossfade` already refuses
+ * to start a crossfade longer than the *outgoing* track; nothing previously
+ * protected the *incoming* side, so a short next track could get cut off
+ * mid-fade. No other property of [context] is read yet.
+ *
+ * `scheduleCrossfade` calls this same method to decide *when* to fire (using
+ * `plan.durationMs`, not the raw configured duration) before the crossfade
+ * even starts, so the capped duration decided here and the trigger time
+ * computed there always agree — see `scheduleCrossfade`'s own doc comment.
+ * Without that, capping the duration here alone would leave the trigger
+ * scheduled for the longer, uncapped window, and the outgoing track would
+ * get released early once the (shorter) fade finished.
  *
  * Like [TransitionPlanFactory], never touches ExoPlayer/DataStore/playback
  * state — only inputs in, a [TransitionPlan] out. Manual crossfades never go
@@ -105,7 +116,9 @@ class SmartCrossfadeEngine {
      *   by the caller.
      * @param curve the configured crossfade curve, resolved by the caller.
      * @param outgoingPositionMs see [TransitionPlan.outgoingPositionMs].
-     * @param context durations for both tracks — unused here for now.
+     * @param context durations for both tracks. Only [TransitionContext.incomingDurationMs]
+     *   is read so far (to cap the duration below); [TransitionContext.outgoingDurationMs]
+     *   is not used by this method yet.
      */
     fun createTransition(
         autoDurationMs: Long,
@@ -113,9 +126,24 @@ class SmartCrossfadeEngine {
         outgoingPositionMs: Long,
         context: TransitionContext,
     ): TransitionPlan = TransitionPlan(
-        durationMs = autoDurationMs,
+        durationMs = cappedDurationMs(autoDurationMs, context),
         outgoingPositionMs = outgoingPositionMs,
         incomingPositionMs = 0L,
         curve = curve,
     )
+
+    /**
+     * Never fade for longer than the incoming track actually lasts. Only
+     * acts when [TransitionContext.incomingDurationMs] is known and positive
+     * and shorter than [autoDurationMs]; otherwise returns [autoDurationMs]
+     * unchanged — an unknown duration is not a reason to guess or shorten.
+     */
+    private fun cappedDurationMs(autoDurationMs: Long, context: TransitionContext): Long {
+        val incoming = context.incomingDurationMs
+        return if (incoming != null && incoming > 0) {
+            autoDurationMs.coerceAtMost(incoming)
+        } else {
+            autoDurationMs
+        }
+    }
 }

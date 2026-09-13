@@ -7,16 +7,17 @@ import org.junit.Test
 /**
  * Unit tests for [SmartCrossfadeEngine.createTransition].
  *
- * These pin down that the engine is currently "dumb on purpose": given the
- * same inputs MusicService already resolves for a plain AUTO crossfade, it
- * must produce the exact same [TransitionPlan] the inline code built before
- * this class existed (see [TransitionPlanFactoryTest] for the equivalent
- * manual-path coverage). No audio analysis, no randomness, no hidden state.
+ * Most of these pin down that the engine is otherwise "dumb on purpose":
+ * given the same inputs MusicService already resolves for a plain AUTO
+ * crossfade, and a [TransitionContext] that doesn't trigger the capping rule
+ * below, it produces the exact same [TransitionPlan] the inline code built
+ * before this class existed (see [TransitionPlanFactoryTest] for the
+ * equivalent manual-path coverage). No audio analysis, no randomness, no
+ * hidden state.
  *
- * The `context: TransitionContext`-specific tests near the bottom exist to
- * prove the data path from MusicService to this class is real (see
- * MusicService.startCrossfade's AUTO branch) without yet influencing any
- * decision — see TransitionContext's own doc comment for why it's nullable.
+ * The capping-rule tests near the bottom cover the engine's first real use of
+ * [TransitionContext]: shortening the duration when the incoming track is
+ * known to be shorter than it — see [TransitionContext]'s own doc comment.
  */
 class SmartCrossfadeEngineTest {
 
@@ -170,30 +171,75 @@ class SmartCrossfadeEngineTest {
         assertEquals(expected, plan)
     }
 
+    // --- Capping rule: never fade longer than the incoming track lasts ---
+
     @Test
-    fun `context is connected but does not affect the decision - varying it alone changes nothing`() {
-        // Holds every other input fixed and only varies the context, across
-        // several shapes (empty, only-outgoing-known, only-incoming-known,
-        // both known, both wildly different from the other cases) — the plan
-        // must come out equal every time. This is the explicit "wired but
-        // inert" guarantee for this stage of the architecture.
-        val contexts = listOf(
-            TransitionContext(),
-            TransitionContext(outgoingDurationMs = 210_000L),
-            TransitionContext(incomingDurationMs = 195_000L),
-            TransitionContext(outgoingDurationMs = 210_000L, incomingDurationMs = 195_000L),
-            TransitionContext(outgoingDurationMs = 1L, incomingDurationMs = 999_999L),
+    fun `duration is capped to a known, shorter incoming track duration`() {
+        val plan = engine.createTransition(
+            autoDurationMs = 7_200L,
+            curve = CrossfadeCurve.SMOOTHSTEP,
+            outgoingPositionMs = 15_000L,
+            context = TransitionContext(incomingDurationMs = 4_000L),
         )
 
-        val plans = contexts.map { context ->
-            engine.createTransition(
-                autoDurationMs = 7_200L,
-                curve = CrossfadeCurve.SMOOTHSTEP,
-                outgoingPositionMs = 15_000L,
-                context = context,
-            )
-        }
+        assertEquals(4_000L, plan.durationMs)
+    }
 
-        plans.forEach { plan -> assertEquals(plans.first(), plan) }
+    @Test
+    fun `duration is unchanged when the incoming track is at least as long as the configured duration`() {
+        val plan = engine.createTransition(
+            autoDurationMs = 7_200L,
+            curve = CrossfadeCurve.SMOOTHSTEP,
+            outgoingPositionMs = 15_000L,
+            context = TransitionContext(incomingDurationMs = 195_000L),
+        )
+
+        assertEquals(7_200L, plan.durationMs)
+    }
+
+    @Test
+    fun `duration is unchanged when the incoming track duration is unknown`() {
+        val plan = engine.createTransition(
+            autoDurationMs = 7_200L,
+            curve = CrossfadeCurve.SMOOTHSTEP,
+            outgoingPositionMs = 15_000L,
+            context = TransitionContext(incomingDurationMs = null),
+        )
+
+        assertEquals(7_200L, plan.durationMs)
+    }
+
+    @Test
+    fun `outgoingDurationMs alone never affects the duration`() {
+        // This stage of the engine only reads incomingDurationMs. Knowing the
+        // outgoing track's length (already handled separately by
+        // scheduleCrossfade, for the outgoing side) must not, by itself,
+        // change anything here.
+        val plan = engine.createTransition(
+            autoDurationMs = 7_200L,
+            curve = CrossfadeCurve.SMOOTHSTEP,
+            outgoingPositionMs = 15_000L,
+            context = TransitionContext(outgoingDurationMs = 1L),
+        )
+
+        assertEquals(7_200L, plan.durationMs)
+    }
+
+    @Test
+    fun `capping is deterministic - same short incoming duration always caps to the same value`() {
+        val a = engine.createTransition(
+            autoDurationMs = 7_200L,
+            curve = CrossfadeCurve.SMOOTHSTEP,
+            outgoingPositionMs = 15_000L,
+            context = TransitionContext(incomingDurationMs = 4_000L),
+        )
+        val b = engine.createTransition(
+            autoDurationMs = 7_200L,
+            curve = CrossfadeCurve.SMOOTHSTEP,
+            outgoingPositionMs = 15_000L,
+            context = TransitionContext(incomingDurationMs = 4_000L),
+        )
+
+        assertEquals(a, b)
     }
 }
