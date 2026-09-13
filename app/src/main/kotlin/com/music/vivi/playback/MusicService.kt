@@ -287,6 +287,18 @@ class MusicService :
     private var crossfadeManualSkipEnabled = false
     private var crossfadeCurve = CrossfadeCurve.EASE_OUT_QUAD
     private var crossfadeTriggerJob: Job? = null
+    // The TransitionPlan computed by scheduleCrossfade() for the upcoming
+    // AUTO crossfade, together with the mediaId of the incoming track it was
+    // computed for. scheduleCrossfade() uses plan.durationMs (not the raw
+    // crossfadeDuration) to decide when to fire, so the trigger time and the
+    // fade length it commits to are always for the exact same decision —
+    // otherwise a capped/shortened duration decided only at fire time could
+    // leave the trigger scheduled for a longer window than the fade actually
+    // runs, cutting the outgoing track off before its natural end. See
+    // startCrossfade's AUTO branch for how this gets consumed (and
+    // invalidated if the queue changed in between).
+    private var scheduledAutoPlan: TransitionPlan? = null
+    private var scheduledAutoPlanTargetMediaId: String? = null
     // Decides the TransitionPlan for automatic (AUTO trigger) crossfades —
     // see SmartCrossfadeEngine's doc comment for why it's not called
     // "AutoMix" (that name is already taken by automixItems/getAutomix()
@@ -3844,6 +3856,8 @@ class MusicService :
     private fun scheduleCrossfade() {
         crossfadeTriggerJob?.cancel()
         crossfadeTriggerJob = null
+        scheduledAutoPlan = null
+        scheduledAutoPlanTargetMediaId = null
         if (!crossfadeEnabled || player.duration == C.TIME_UNSET || player.duration <= crossfadeDuration) return
         if (crossfadeGapless && isNextItemGapless()) return
         // Repeat-one loops the *same* track back into itself at its natural
@@ -3858,11 +3872,44 @@ class MusicService :
         if (player.repeatMode == REPEAT_MODE_ONE) return
         if (!player.hasNextMediaItem()) return
 
-        val triggerTime = player.duration - crossfadeDuration.toLong()
+        val targetIndex = player.nextMediaItemIndex
+        if (targetIndex == C.INDEX_UNSET) return
+        val targetMediaItem = player.getMediaItemAt(targetIndex)
+
+        // Same context sources as startCrossfade's AUTO branch (see there for
+        // why incomingDurationMs comes from catalog metadata, not ExoPlayer's
+        // own Timeline.Window duration for the target).
+        val transitionContext = TransitionContext(
+            outgoingDurationMs = player.duration.takeIf { it != C.TIME_UNSET },
+            incomingDurationMs = targetMediaItem.metadata?.duration?.let { it * 1000L },
+        )
+        // outgoingPositionMs is a placeholder here (0L) — it's informational
+        // only, and gets set to the real predicted trigger position right
+        // below once plan.durationMs (the value that actually matters for
+        // scheduling) is known, then refreshed again to the *actual* position
+        // when the trigger really fires — see startCrossfade's AUTO branch.
+        val provisionalPlan = smartCrossfadeEngine.createTransition(
+            autoDurationMs = crossfadeDuration.toLong(),
+            curve = crossfadeCurve,
+            outgoingPositionMs = 0L,
+            context = transitionContext,
+        )
+
+        // Use the plan's own (possibly capped) duration to decide when to
+        // fire, not the raw configured crossfadeDuration — otherwise a short
+        // incoming track that gets capped below the configured duration would
+        // still be scheduled for the longer, uncapped window, and the
+        // outgoing track would get cut off before its natural end once the
+        // (shorter) fade finishes and cleanupCrossfade() releases it.
+        val triggerTime = player.duration - provisionalPlan.durationMs
         val delayMs = triggerTime - player.currentPosition
         if (delayMs <= 0) return
 
+        val plan = provisionalPlan.copy(outgoingPositionMs = triggerTime)
         val targetMediaId = player.currentMediaItem?.mediaId
+
+        scheduledAutoPlan = plan
+        scheduledAutoPlanTargetMediaId = targetMediaItem.mediaId
 
         crossfadeTriggerJob = scope.launch {
             delay(delayMs)
@@ -4114,34 +4161,47 @@ class MusicService :
         if (targetIndex == C.INDEX_UNSET) return
 
         // AUTO (natural end-of-track) is decided by SmartCrossfadeEngine — see
-        // its doc comment; today it reproduces the same duration/curve/
-        // position-0 plan this branch always built directly, so this changes
-        // nothing about what plays. A manual next/previous skip keeps using
-        // TransitionPlanFactory directly and the (possibly shorter)
-        // manual-skip duration, untouched by this. Written as an exhaustive
-        // `when` (no `else`) rather than `if (trigger == AUTO) ... else ...`
-        // on purpose: if a new CrossfadeTrigger value is ever added, this
-        // fails to compile instead of silently routing it through either path.
+        // its doc comment. scheduleCrossfade() already computed this plan
+        // (using its durationMs, not the raw configured one, to decide when
+        // to fire — see there) and stashed it in scheduledAutoPlan alongside
+        // the incoming track's mediaId at that time. Reuse it as-is if the
+        // target is still the same track; only recompute if the queue
+        // changed between scheduling and firing (scheduleCrossfade doesn't
+        // re-run on queue mutations, only on playback-state/seek events), so
+        // a stale plan is never trusted for a track it wasn't built for. A
+        // manual next/previous skip keeps using TransitionPlanFactory
+        // directly and the (possibly shorter) manual-skip duration,
+        // untouched by any of this. Written as an exhaustive `when` (no
+        // `else`) rather than `if (trigger == AUTO) ... else ...` on purpose:
+        // if a new CrossfadeTrigger value is ever added, this fails to
+        // compile instead of silently routing it through either path.
         val plan = when (trigger) {
             CrossfadeTrigger.AUTO -> {
-                // Outgoing: ExoPlayer's own measured duration of the track
-                // currently playing — null if not yet resolved. Incoming:
-                // catalog-provided duration attached to the target MediaItem
-                // at construction time (Song/SongItem/MediaMetadata.toMediaItem()),
-                // available whether or not that item has been buffered yet —
-                // see TransitionContext's doc comment for why this is used
-                // instead of the target's own (often-unset) Timeline.Window
-                // duration.
-                val transitionContext = TransitionContext(
-                    outgoingDurationMs = player.duration.takeIf { it != C.TIME_UNSET },
-                    incomingDurationMs = player.getMediaItemAt(targetIndex).metadata?.duration?.let { it * 1000L },
-                )
-                smartCrossfadeEngine.createTransition(
-                    autoDurationMs = crossfadeDuration.toLong(),
-                    curve = crossfadeCurve,
-                    outgoingPositionMs = player.currentPosition,
-                    context = transitionContext,
-                )
+                val targetMediaItem = player.getMediaItemAt(targetIndex)
+                val cached = scheduledAutoPlan
+                if (cached != null && scheduledAutoPlanTargetMediaId == targetMediaItem.mediaId) {
+                    cached.copy(outgoingPositionMs = player.currentPosition)
+                } else {
+                    // Outgoing: ExoPlayer's own measured duration of the
+                    // track currently playing — null if not yet resolved.
+                    // Incoming: catalog-provided duration attached to the
+                    // target MediaItem at construction time
+                    // (Song/SongItem/MediaMetadata.toMediaItem()), available
+                    // whether or not that item has been buffered yet — see
+                    // TransitionContext's doc comment for why this is used
+                    // instead of the target's own (often-unset)
+                    // Timeline.Window duration.
+                    val transitionContext = TransitionContext(
+                        outgoingDurationMs = player.duration.takeIf { it != C.TIME_UNSET },
+                        incomingDurationMs = targetMediaItem.metadata?.duration?.let { it * 1000L },
+                    )
+                    smartCrossfadeEngine.createTransition(
+                        autoDurationMs = crossfadeDuration.toLong(),
+                        curve = crossfadeCurve,
+                        outgoingPositionMs = player.currentPosition,
+                        context = transitionContext,
+                    )
+                }
             }
             CrossfadeTrigger.MANUAL_NEXT, CrossfadeTrigger.MANUAL_PREVIOUS -> TransitionPlanFactory.forCurrentSettings(
                 isManualTransition = true,
@@ -4151,6 +4211,8 @@ class MusicService :
                 outgoingPositionMs = player.currentPosition,
             )
         }
+        scheduledAutoPlan = null
+        scheduledAutoPlanTargetMediaId = null
 
         beginCrossfadeSwap("startCrossfade", plan) { secPlayer ->
             setupSecondaryFromPrimaryQueue(secPlayer, targetIndex, savedRepeatMode, savedShuffleEnabled, plan.incomingPositionMs)
